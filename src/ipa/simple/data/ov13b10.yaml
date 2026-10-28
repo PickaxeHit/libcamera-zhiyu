@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      # 16 at 10 bits, in the 16-bit scale the tuning file uses.
+      blackLevel: 4096
+  - Awb:
+  - Ccm:
+      # Approximate, not measured from a colour chart: it opens up the
+      # green-dominant response of the sensor enough for skin tones to look
+      # plausible.
+      ccms:
+        - ct: 6500
+          ccm: [ 1.45, -0.30, -0.15,
+                -0.25,  1.40, -0.15,
+                -0.15, -0.30,  1.45 ]
+  - Adjust:
+  - Agc:
+      # Below mid-range: the gamma stage that follows lifts the image, and
+      # mid-range leaves highlights clipped.
+      target: 1.8
+...
