@@ -259,7 +259,15 @@ void main(void)
 	rgb.b = apply_contrast(rgb.b);
 
 	/* Apply gamma after colour correction */
-	rgb = pow(rgb, vec3(gamma));
+	rgb = pow(clamp(rgb, 0.0, 1.0), vec3(gamma));
+
+	/*
+	 * Soft shoulder: squeeze the top of the range towards white instead of
+	 * clipping it, so that a bright window or a lamp fades out rather than
+	 * turning into a flat white patch with a hard edge.
+	 */
+	vec3 knee = smoothstep(vec3(0.75), vec3(1.0), rgb);
+	rgb = mix(rgb, 1.0 - (1.0 - rgb) * (1.0 - rgb), knee);
 
 #if defined (SWAP_BLUE)
 	gl_FragColor = vec4(rgb.bgr, 1.0);
