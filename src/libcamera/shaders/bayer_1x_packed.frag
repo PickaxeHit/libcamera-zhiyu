@@ -65,6 +65,8 @@ uniform vec2 tex_step;
 uniform vec2 tex_bayer_first_red;
 
 uniform sampler2D tex_y;
+uniform sampler2D lsc;
+uniform float lscEnabled;
 uniform vec3 awb;
 uniform mat3 ccm;
 uniform vec3 blacklevel;
@@ -231,6 +233,15 @@ void main(void)
 	 * reworked into a single multiplication.
 	 */
 	rgb = (rgb - blacklevel) / (1.0 - blacklevel);
+
+	/*
+	 * Lens shading correction, before AWB since it compensates for the
+	 * lens, not for the illuminant.  The texture holds the gain divided by
+	 * two, so that 0.5x..2.0x fits in an 8-bit per channel texture.
+	 */
+	if (lscEnabled > 0.5)
+		rgb *= clamp(texture2D(lsc, (center_pixel + 0.5) / tex_size).rgb * 2.0,
+			     vec3(0.5), vec3(2.0));
 
 	/* Apply AWB gains, and saturate each channel at sensor range */
 	rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));

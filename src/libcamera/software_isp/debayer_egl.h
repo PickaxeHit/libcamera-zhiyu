@@ -111,6 +111,11 @@ private:
 	/* Contrast */
 	GLint contrastExpUniformDataIn_;
 
+	/* Lens shading correction */
+	GLint lscUniformDataIn_;
+	GLint lscEnabledUniformDataIn_;
+	GLuint lscTextureId_ = 0;
+
 	Size nativeOutputSize_;
 	Rectangle window_;
 	std::unique_ptr<SwStatsCpu> stats_;

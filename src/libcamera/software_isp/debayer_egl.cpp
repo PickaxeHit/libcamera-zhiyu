@@ -10,6 +10,7 @@
 #include "debayer_egl.h"
 
 #include <algorithm>
+#include <array>
 #include <assert.h>
 #include <memory>
 #include <stdlib.h>
@@ -121,6 +122,8 @@ int DebayerEGL::getShaderVariableLocations(void)
 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
+	lscUniformDataIn_ = glGetUniformLocation(programId_, "lsc");
+	lscEnabledUniformDataIn_ = glGetUniformLocation(programId_, "lscEnabled");
 
 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
@@ -135,6 +138,8 @@ int DebayerEGL::getShaderVariableLocations(void)
 			    << " blacklevel " << blackLevelUniformDataIn_
 			    << " gamma " << gammaUniformDataIn_
 			    << " contrastExp " << contrastExpUniformDataIn_
+			    << " lsc " << lscUniformDataIn_
+			    << " lscEnabled " << lscEnabledUniformDataIn_
 			    << " tex_step " << textureUniformStep_
 			    << " tex_size " << textureUniformSize_
 			    << " stride_factor " << textureUniformStrideFactor_
@@ -503,6 +508,43 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
 	 */
 	glUniform1f(contrastExpUniformDataIn_, params.contrastExp);
 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+
+	/*
+	 * Lens shading correction.  The gains are stored as 8-bit values scaled
+	 * by two, which covers the 0.5x..2.0x range that a flat-field
+	 * calibration produces; linear filtering of float textures is not
+	 * portable on GLES, so the grid is uploaded as integers and the shader
+	 * interpolates between the samples.
+	 */
+	if (params.lscEnabled) {
+		std::array<uint8_t, DebayerParams::kLscCols *
+					    DebayerParams::kLscRows * 3> lut;
+
+		for (unsigned int i = 0; i < lut.size(); i++) {
+			int v = params.lsc[i] * 127.5f + 0.5f;
+			lut[i] = static_cast<uint8_t>(std::clamp(v, 0, 255));
+		}
+
+		glActiveTexture(GL_TEXTURE2);
+		if (!lscTextureId_) {
+			glGenTextures(1, &lscTextureId_);
+			glBindTexture(GL_TEXTURE_2D, lscTextureId_);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		}
+
+		glBindTexture(GL_TEXTURE_2D, lscTextureId_);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8,
+			     DebayerParams::kLscCols, DebayerParams::kLscRows, 0,
+			     GL_RGB, GL_UNSIGNED_BYTE, lut.data());
+		glUniform1i(lscUniformDataIn_, 2);
+		glUniform1f(lscEnabledUniformDataIn_, 1.0f);
+		glActiveTexture(GL_TEXTURE0);
+	} else {
+		glUniform1f(lscEnabledUniformDataIn_, 0.0f);
+	}
 
 	return;
 }

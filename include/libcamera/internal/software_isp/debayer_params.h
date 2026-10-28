@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <array>
 #include <stdint.h>
 
 #include "libcamera/internal/matrix.h"
@@ -18,6 +19,16 @@
 namespace libcamera {
 
 struct DebayerParams {
+	/*
+	 * Lens shading correction grid: per-colour gains sampled on a regular
+	 * grid covering the frame, row major, origin at the top left.  The
+	 * grid is interpolated bilinearly between samples.
+	 */
+	static constexpr unsigned int kLscCols = 17;
+	static constexpr unsigned int kLscRows = 13;
+	std::array<float, kLscCols * kLscRows * 3> lsc = {};
+	bool lscEnabled = false;
+
 	Matrix<float, 3, 3> combinedMatrix = { { 1.0, 0.0, 0.0,
 						 0.0, 1.0, 0.0,
 						 0.0, 0.0, 1.0 } };
