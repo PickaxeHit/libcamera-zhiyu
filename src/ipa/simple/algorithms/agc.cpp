@@ -62,7 +62,24 @@ static constexpr float kExpProportionalGain = 0.04;
 static constexpr float kExpMaxStep = 0.15;
 
 Agc::Agc()
+	: target_(kExposureOptimal)
 {
+}
+
+int Agc::init([[maybe_unused]] IPAContext &context,
+	      const ValueNode &tuningData)
+{
+	/*
+	 * How bright a frame the pipeline should produce, expressed as the
+	 * mean sample value of the histogram in 0..kExposureBinsCount units.
+	 * Aiming higher than mid-range clips highlights: the gamma stage that
+	 * follows this algorithm expands the top of the range further.
+	 */
+	auto target = tuningData["target"].get<float>();
+	if (target.has_value())
+		target_ = target.value();
+
+	return 0;
 }
 
 void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
@@ -70,7 +87,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
 	int32_t &exposure = frameContext.sensor.exposure;
 	double &again = frameContext.sensor.gain;
 
-	double error = kExposureOptimal - exposureMSV;
+	double error = target_ - exposureMSV;
 
 	if (std::abs(error) <= kExposureSatisfactory)
 		return;

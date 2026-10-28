@@ -19,12 +19,17 @@ public:
 	Agc();
 	~Agc() = default;
 
+	int init(IPAContext &context, const ValueNode &tuningData) override;
+
 	void process(IPAContext &context, const uint32_t frame,
 		     IPAFrameContext &frameContext,
 		     const SwIspStats *stats,
 		     ControlList &metadata) override;
 
 private:
+	/* Mean sample value to aim for; set by the "target" tuning knob. */
+	float target_;
+
 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
 };
 
