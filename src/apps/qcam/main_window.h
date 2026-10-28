@@ -70,8 +70,12 @@ private Q_SLOTS:
 
 	void renderComplete(libcamera::FrameBuffer *buffer);
 
+	void autoFocus();
+
 private:
 	int createToolbars();
+
+	void waitForFrames(unsigned int count);
 
 	std::shared_ptr<libcamera::Camera> chooseCamera();
 	int openCamera();
