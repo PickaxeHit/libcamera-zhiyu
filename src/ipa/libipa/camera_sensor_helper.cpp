@@ -827,6 +827,24 @@ public:
 };
 REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
 
+/*
+ * OmniVision OV13B10, as used by the Lenovo TB378FC rear camera.
+ *
+ * The V4L2 analogue gain control carries the raw 16-bit 0x3508/0x3509
+ * register value, 128 being 1.0x, so gain is linear in the register.  The
+ * datasheet black level is 16 at 10 bits, 4096 in libcamera's 16-bit scale.
+ */
+class CameraSensorHelperOv13b10 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperOv13b10()
+	{
+		blackLevel_ = 4096;
+		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("ov13b10", CameraSensorHelperOv13b10)
+
 class CameraSensorHelperVd55g1 : public CameraSensorHelper
 {
 public:
