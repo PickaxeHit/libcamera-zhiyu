@@ -185,8 +185,8 @@ void Agc::process(IPAContext &context,
 	const unsigned int yHistValsPerBinMod =
 		histogramSize / (histogramSize % kExposureBinsCount + 1);
 	int exposureBins[kExposureBinsCount] = {};
-	unsigned int denom = 0;
-	unsigned int num = 0;
+	double weightedSum = 0.0;
+	double weightSum = 0.0;
 
 	if (yHistValsPerBin == 0) {
 		LOG(IPASoftExposure, Debug)
@@ -201,11 +201,22 @@ void Agc::process(IPAContext &context,
 
 	for (unsigned int i = 0; i < kExposureBinsCount; i++) {
 		LOG(IPASoftExposure, Debug) << i << ": " << exposureBins[i];
-		denom += exposureBins[i];
-		num += exposureBins[i] * (i + 1);
+
+		/*
+		 * Weight each bin by the square of its brightness, so that the
+		 * bright end of the histogram pulls the mean sample value up
+		 * and the AGC stops before the highlights clip.  Picking a
+		 * fixed percentile would do the same job, but makes the value
+		 * jump between bins from frame to frame, which shows up as
+		 * flicker.
+		 */
+		const double weight = (i + 1) * (i + 1);
+		weightedSum += exposureBins[i] * weight * (i + 1);
+		weightSum += exposureBins[i] * weight;
 	}
 
-	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+	float exposureMSV = weightSum == 0.0 ? 0.0f
+					    : static_cast<float>(weightedSum / weightSum);
 	updateExposure(context, frameContext, exposureMSV);
 }
 
