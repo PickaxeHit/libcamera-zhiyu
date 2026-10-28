@@ -5,6 +5,7 @@
  * Simple Software Image Processing Algorithm module
  */
 
+#include <array>
 #include <chrono>
 #include <stdint.h>
 #include <sys/mman.h>
@@ -79,6 +80,11 @@ private:
 	std::unique_ptr<CameraSensorHelper> camHelper_;
 	ControlInfoMap sensorInfoMap_;
 
+	std::array<float, DebayerParams::kLscCols * DebayerParams::kLscRows * 3> lscGrid_;
+	bool lscValid_ = false;
+
+	void loadLscGrid(const std::string &model, const std::string &tuningFile);
+
 	/* Local parameter storage */
 	struct IPAContext context_;
 };
@@ -107,6 +113,8 @@ int IPASoftSimple::init(const IPASettings &settings,
 	}
 
 	context_.sensorInfo = sensorInfo;
+
+	loadLscGrid(settings.sensorModel, settings.configurationFile);
 
 	/* Load the tuning data file */
 	File file(settings.configurationFile);
@@ -197,6 +205,42 @@ int IPASoftSimple::init(const IPASettings &settings,
 	}
 
 	return 0;
+}
+
+/*
+ * The optional lens shading calibration lives next to the tuning file as
+ * <model>.lsc: a raw array of float32 gains, DebayerParams::kLscRows rows of
+ * DebayerParams::kLscCols pixels, red/green/blue interleaved per sample.
+ * Without the file the correction is simply left off.
+ */
+void IPASoftSimple::loadLscGrid(const std::string &model,
+				const std::string &tuningFile)
+{
+	size_t slash = tuningFile.rfind('/');
+	if (slash == std::string::npos)
+		return;
+
+	const std::string path = tuningFile.substr(0, slash + 1) + model + ".lsc";
+	const size_t size = sizeof(lscGrid_);
+
+	File file(path);
+	if (!file.open(File::OpenModeFlag::ReadOnly))
+		return;
+
+	if (file.size() != static_cast<ssize_t>(size)) {
+		LOG(IPASoft, Error)
+			<< "Ignoring " << path << ", expected " << size << " bytes";
+		return;
+	}
+
+	Span<uint8_t> raw(reinterpret_cast<uint8_t *>(lscGrid_.data()), size);
+	if (file.read(raw) != static_cast<ssize_t>(size)) {
+		LOG(IPASoft, Error) << "Failed to read " << path;
+		return;
+	}
+
+	lscValid_ = true;
+	LOG(IPASoft, Info) << "Loaded lens shading correction from " << path;
 }
 
 int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
@@ -291,6 +335,11 @@ void IPASoftSimple::computeParams(const uint32_t frame)
 	for (const auto &algo : algorithms())
 		algo->prepare(context_, frame, frameContext, params_);
 	params_->combinedMatrix = context_.activeState.combinedMatrix;
+
+	if (lscValid_) {
+		params_->lsc = lscGrid_;
+		params_->lscEnabled = true;
+	}
 
 	setIspParams.emit();
 }
