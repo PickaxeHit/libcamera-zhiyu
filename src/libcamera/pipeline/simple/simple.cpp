@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <iterator>
 #include <list>
 #include <map>
@@ -34,7 +35,9 @@
 
 #include "libcamera/internal/camera.h"
 #include "libcamera/internal/camera_manager.h"
+#include "libcamera/internal/camera_lens.h"
 #include "libcamera/internal/camera_sensor.h"
+#include "libcamera/internal/mapped_framebuffer.h"
 #include "libcamera/internal/camera_sensor_properties.h"
 #include "libcamera/internal/converter.h"
 #include "libcamera/internal/delayed_controls.h"
@@ -275,6 +278,256 @@ bool isRaw(const StreamConfiguration &cfg)
 
 } /* namespace */
 
+/*
+ * Contrast-detect autofocus, for cameras whose lens is a plain V4L2
+ * sub-device.  It samples the raw frames at the sensor's own resolution,
+ * measures high-frequency content, and walks the lens over its range to
+ * find the peak.
+ *
+ * The lens is open loop, so the search is the only way to know where the
+ * focus is; the measurement is normalised by the frame's mean level so that
+ * the exposure control, which is still settling while the sweep runs, does
+ * not masquerade as focus.
+ */
+class SimpleAutofocus
+{
+public:
+	void attach(CameraSensor *sensor)
+	{
+		lens_ = sensor ? sensor->focusLens() : nullptr;
+		if (!lens_)
+			return;
+
+		const ControlInfoMap &ctrls = lens_->controls();
+		auto it = ctrls.find(V4L2_CID_FOCUS_ABSOLUTE);
+		if (it == ctrls.end()) {
+			LOG(SimplePipeline, Info)
+				<< "Lens " << lens_->model()
+				<< " has no focus control, autofocus disabled";
+			lens_ = nullptr;
+			return;
+		}
+
+		min_ = it->second.min().get<int32_t>();
+		max_ = it->second.max().get<int32_t>();
+
+		LOG(SimplePipeline, Info)
+			<< "Autofocus on lens " << lens_->model()
+			<< ", positions " << min_ << ".." << max_;
+	}
+
+	void configure(const Size &size, unsigned int stride)
+	{
+		size_ = size;
+		stride_ = stride;
+	}
+
+	void start()
+	{
+		if (!lens_)
+			return;
+
+		frames_ = 0;
+		step_ = 0;
+		bestScore_ = 0;
+		bestPos_ = min_;
+		lowCount_ = 0;
+
+		steps_.clear();
+		unsigned int n = 16;
+		for (unsigned int i = 0; i <= n; i++)
+			steps_.push_back(min_ + (max_ - min_) * i / n);
+
+		state_ = State::Sweep;
+		move(steps_[0]);
+	}
+
+	void process(const FrameBuffer *buffer)
+	{
+		if (!lens_ || state_ == State::Off)
+			return;
+
+		/* Let the exposure control settle before measuring anything. */
+		if (frames_ < 8) {
+			frames_++;
+			return;
+		}
+
+		if (settle_) {
+			settle_--;
+			return;
+		}
+
+		const double score = measure(buffer);
+
+		LOG(SimplePipeline, Debug)
+			<< "Autofocus position " << steps_[step_]
+			<< " score " << score;
+
+		switch (state_) {
+		case State::Sweep:
+		case State::Refine:
+			if (score > bestScore_ && score > 0.0) {
+				bestScore_ = score;
+				bestPos_ = steps_[step_];
+			}
+
+			if (++step_ < steps_.size()) {
+				move(steps_[step_]);
+				break;
+			}
+
+			if (state_ == State::Sweep) {
+				refineAround(bestPos_);
+			} else {
+				state_ = State::Locked;
+				lockScore_ = bestScore_;
+				move(bestPos_);
+				LOG(SimplePipeline, Info)
+					<< "Autofocus locked at " << bestPos_
+					<< " (score " << bestScore_ << ")";
+			}
+			break;
+
+		case State::Locked:
+			/*
+			 * Something changed: the scene, or the distance.  Look
+			 * again around the current position, which is much
+			 * cheaper than a full sweep.
+			 */
+			if (lockScore_ > 0.0 && score < lockScore_ * 0.6) {
+				if (++lowCount_ > 3) {
+					lowCount_ = 0;
+					refineAround(bestPos_);
+				}
+			} else {
+				lowCount_ = 0;
+			}
+			break;
+
+		default:
+			break;
+		}
+	}
+
+private:
+	enum class State { Off, Sweep, Refine, Locked };
+
+	void move(int position)
+	{
+		int ret = lens_->setFocusPosition(position);
+		if (ret)
+			LOG(SimplePipeline, Warning)
+				<< "Failed to set focus position " << position;
+		/* One frame to let the lens settle before measuring. */
+		settle_ = 2;
+	}
+
+	void refineAround(int centre)
+	{
+		const int coarse = (max_ - min_) / 16;
+		const int step = coarse > 4 ? coarse / 4 : 1;
+
+		steps_.clear();
+		for (int pos = centre - coarse; pos <= centre + coarse; pos += step)
+			steps_.insert(steps_.end(), std::clamp(pos, min_, max_));
+
+		step_ = 0;
+		bestScore_ = 0;
+		state_ = State::Refine;
+		move(steps_[0]);
+	}
+
+	/*
+	 * High-frequency content of the raw frame, divided by its mean level:
+	 * a defocused frame loses contrast, a brighter frame does not gain
+	 * apparent sharpness.
+	 */
+	double measure(const FrameBuffer *buffer) const
+	{
+		MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
+		if (!map.isValid())
+			return 0.0;
+
+		const Span<uint8_t> &plane = map.planes()[0];
+		const uint8_t *base = plane.data();
+		const unsigned long long length = plane.size();
+		const unsigned int stride = stride_ ? stride_ : 4 * size_.width;
+		const unsigned int step = 4;
+
+		if (!stride || !length || !size_.width || !size_.height)
+			return 0.0;
+
+		const unsigned int width = size_.width / step;
+
+		/*
+		 * Variance of the Laplacian of a subsampled greyscale copy:
+		 * high when the image has strong edges, low when the lens is
+		 * out of focus.  Measured after the ISP, on the same frames the
+		 * application receives, which is where the metric was found to
+		 * track the lens position.
+		 */
+		std::vector<uint8_t> grey;
+		grey.reserve(static_cast<size_t>(width) * (size_.height / step));
+
+		for (unsigned int y = 0; y < size_.height; y += step) {
+			const unsigned long long offset = (unsigned long long)y * stride;
+			if (offset + stride > length)
+				break;
+
+			const uint8_t *row = base + offset;
+			for (unsigned int x = 0; x < size_.width; x += step) {
+				const uint8_t *px = row + x * 4;
+				grey.push_back((px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8);
+			}
+		}
+
+		const unsigned int rows = width ? grey.size() / width : 0;
+		if (rows < 3)
+			return 0.0;
+
+		double sum = 0.0, sum2 = 0.0;
+		unsigned long long n = 0;
+
+		for (unsigned int y = 1; y < rows - 1; y++) {
+			const uint8_t *r0 = &grey[(y - 1) * width];
+			const uint8_t *r1 = &grey[y * width];
+			const uint8_t *r2 = &grey[(y + 1) * width];
+
+			for (unsigned int x = 1; x < width - 1; x++) {
+				const double lap = -4.0 * r1[x] + r0[x] + r2[x]
+						   + r1[x - 1] + r1[x + 1];
+				sum += lap;
+				sum2 += lap * lap;
+				n++;
+			}
+		}
+
+		if (!n)
+			return 0.0;
+
+		const double mean = sum / n;
+		return sum2 / n - mean * mean;
+	}
+
+	CameraLens *lens_ = nullptr;
+	State state_ = State::Off;
+	Size size_;
+	unsigned int stride_ = 0;
+
+	std::vector<int> steps_;
+	unsigned int step_ = 0;
+	unsigned int settle_ = 0;
+	unsigned int frames_ = 0;
+
+	int min_ = 0;
+	int max_ = 0;
+	int bestPos_ = 0;
+	double bestScore_ = 0;
+	double lockScore_ = 0;
+	unsigned int lowCount_ = 0;
+};
+
 class SimpleCameraData : public Camera::Private
 {
 public:
@@ -341,6 +594,7 @@ public:
 	 */
 	std::list<Entity> entities_;
 	std::unique_ptr<CameraSensor> sensor_;
+	SimpleAutofocus af_;
 	V4L2VideoDevice *video_;
 	V4L2Subdevice *frameStartEmitter_;
 
@@ -1018,6 +1272,8 @@ void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
 {
 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
 
+	af_.process(buffer);
+
 	/* Complete the buffer and the request. */
 	Request *request = buffer->request();
 	if (pipe->completeBuffer(request, buffer))
@@ -1566,6 +1822,8 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 		return -EINVAL;
 	}
 
+	data->af_.attach(data->sensor_.get());
+
 	if (requested_bpl && captureFormat.planes[0].bpl != requested_bpl) {
 		LOG(SimplePipeline, Info)
 			<< "Input buffer stride ignored by the driver. "
@@ -1593,6 +1851,9 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 
 	if (outputCfgs.empty())
 		return 0;
+
+	data->af_.configure(outputCfgs.front().get().size,
+			    outputCfgs.front().get().stride);
 
 	StreamConfiguration inputCfg;
 	inputCfg.pixelFormat = videoFormat.toPixelFormat();
@@ -1676,6 +1937,8 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 	}
 
 	ret = video->streamOn();
+	if (!ret)
+		data->af_.start();
 	if (ret < 0) {
 		stop(camera);
 		return ret;
