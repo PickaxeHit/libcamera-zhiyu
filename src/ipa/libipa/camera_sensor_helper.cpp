@@ -845,6 +845,26 @@ public:
 };
 REGISTER_CAMERA_SENSOR_HELPER("ov13b10", CameraSensorHelperOv13b10)
 
+/*
+ * GalaxyCore GC08A8, as used by the Lenovo TB378FC front camera.
+ *
+ * Same story as the OV13B10 above: the sensor's black pedestal is 16 at
+ * 10 bits, which is 4096 in libcamera's 16-bit scale.  Without this entry the
+ * simple IPA assumes a black level of zero, never subtracts the pedestal and
+ * the picture comes out grey and flat.  The V4L2 analogue gain control carries
+ * the raw register value with 1024 as 1.0x.
+ */
+class CameraSensorHelperGc08a8 : public CameraSensorHelper
+{
+public:
+	CameraSensorHelperGc08a8()
+	{
+		blackLevel_ = 4096;
+		gain_ = AnalogueGainLinear{ 1, 0, 0, 1024 };
+	}
+};
+REGISTER_CAMERA_SENSOR_HELPER("gc08a8", CameraSensorHelperGc08a8)
+
 class CameraSensorHelperVd55g1 : public CameraSensorHelper
 {
 public:
