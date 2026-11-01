@@ -22,6 +22,7 @@
 #include <libcamera/base/utils.h>
 
 #include <libcamera/camera.h>
+#include <libcamera/property_ids.h>
 #include <libcamera/control_ids.h>
 #include <libcamera/controls.h>
 #include <libcamera/formats.h>
@@ -227,7 +228,15 @@ void V4L2CameraProxy::querycap(std::shared_ptr<Camera> camera)
 
 	utils::strlcpy(reinterpret_cast<char *>(capabilities_.driver), driver.c_str(),
 		       sizeof(capabilities_.driver));
-	utils::strlcpy(reinterpret_cast<char *>(capabilities_.card), camera->id().c_str(),
+	/*
+	 * Applications show this as the device name, so put the sensor model
+	 * in front of the immutable camera id: several cameras on one platform
+	 * otherwise look identical in a device list.
+	 */
+	const std::string_view model =
+		camera->properties().get(properties::Model).value_or("camera");
+	const std::string card = std::string(model) + " (" + camera->id() + ")";
+	utils::strlcpy(reinterpret_cast<char *>(capabilities_.card), card.c_str(),
 		       sizeof(capabilities_.card));
 	utils::strlcpy(reinterpret_cast<char *>(capabilities_.bus_info), bus_info.c_str(),
 		       sizeof(capabilities_.bus_info));

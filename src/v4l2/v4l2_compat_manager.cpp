@@ -10,6 +10,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <map>
+#include <vector>
+#include <set>
+#include <numeric>
+#include <algorithm>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
@@ -109,33 +113,59 @@ int V4L2CompatManager::getCameraIndex(int fd)
 
 	const dev_t devnum = statbuf.st_rdev;
 
-	/*
-	 * Iterate each known camera and identify if it reports this nodes
-	 * device number in its list of SystemDevices.
-	 */
 	auto cameras = cm_->cameras();
-	for (auto [index, camera] : utils::enumerate(cameras)) {
+
+	/*
+	 * Several cameras can share the same video device nodes (on the CAMSS
+	 * pipeline both sensors are reachable through the same nodes), in which
+	 * case the device number alone cannot tell them apart.  Let the caller
+	 * pick one explicitly; libcamerify's -c option sets this.
+	 */
+	/*
+	 * Order the cameras by id: the enumeration order of the camera manager
+	 * is not guaranteed, so both the node mapping and the explicit choice
+	 * have to be pinned to something stable.
+	 */
+	std::vector<size_t> order(cameras.size());
+	std::iota(order.begin(), order.end(), 0);
+	std::sort(order.begin(), order.end(), [&cameras](size_t a, size_t b) {
+		return cameras[a]->id() < cameras[b]->id();
+	});
+
+	const char *cameraEnv = utils::secure_getenv("LIBCAMERA_V4L2_CAMERA");
+	if (cameraEnv) {
+		char *end = nullptr;
+		unsigned long index = strtoul(cameraEnv, &end, 10);
+		if (end && *end == '\0' && index < order.size())
+			return order[index];
+	}
+
+	/*
+	 * Give every camera one node: order the nodes of the camera subsystem
+	 * by device number and hand them out in camera order.  This keeps the
+	 * mapping stable for applications, which select a camera through the
+	 * node they open.  Nodes past the last camera are reported as camera
+	 * nodes without a camera so that opening them is refused - otherwise an
+	 * application sees a long list of identical devices that cannot be used
+	 * (three of them are not even reachable through libcamera).
+	 */
+	std::set<int64_t> nodes;
+	for (const std::shared_ptr<Camera> &camera : cameras) {
 		Span<const int64_t> devices = camera->properties()
 						      .get(properties::SystemDevices)
 						      .value_or(utils::defopt);
+		nodes.insert(devices.begin(), devices.end());
+	}
 
-		/*
-		 * While there may be multiple cameras that could reference the
-		 * same device node, we take a first match as a best effort for
-		 * now.
-		 *
-		 * \todo Each camera can be accessed through any of the video
-		 * device nodes that it uses. This may confuse applications.
-		 * Consider reworking the V4L2 adaptation layer to instead
-		 * expose each Camera instance through a single video device
-		 * node (with a consistent and stable mapping). The other
-		 * device nodes could possibly be hidden from the application
-		 * by intercepting additional calls to the C library.
-		 */
-		for (const int64_t dev : devices) {
-			if (dev == static_cast<int64_t>(devnum))
-				return index;
+	int64_t index = 0;
+	for (const int64_t dev : nodes) {
+		if (dev != static_cast<int64_t>(devnum)) {
+			index++;
+			continue;
 		}
+		if (static_cast<size_t>(index) < order.size())
+			return order[index];
+		return -2;
 	}
 
 	return -1;
@@ -157,6 +187,13 @@ int V4L2CompatManager::openat(int dirfd, const char *path, int oflag, mode_t mod
 		start();
 
 	ret = getCameraIndex(fd);
+	if (ret == -2) {
+		LOG(V4L2Compat, Debug) << "Refusing " << path
+				       << ", no camera for this node";
+		fops_.close(fd);
+		errno = ENODEV;
+		return -1;
+	}
 	if (ret < 0) {
 		LOG(V4L2Compat, Debug) << "No camera found for " << path;
 		return fd;
