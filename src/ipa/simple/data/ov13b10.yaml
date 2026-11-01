@@ -3,6 +3,7 @@
 ---
 version: 1
 algorithms:
+  - Af:
   - BlackLevel:
       # 16 at 10 bits, in the 16-bit scale the tuning file uses.
       blackLevel: 4096

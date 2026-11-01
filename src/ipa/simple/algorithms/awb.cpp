@@ -55,6 +55,13 @@ void Awb::process(IPAContext &context,
 	metadata.set(controls::ColourGains, { frameContext.gains.r(),
 					      frameContext.gains.b() });
 
+	/*
+	 * Hold the white balance while an autofocus search runs: the colour
+	 * gains move the luma of the picture, and with it the focus value.
+	 */
+	if (context.configuration.freezeAe)
+		return;
+
 	if (!stats->valid)
 		return;
 

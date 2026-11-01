@@ -416,9 +416,14 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
 		}
 
 		sharedStats_->sum_ >>= sumShift_;
+		/* Keep the image measurement when the debayer produces one. */
+		if (!imageSharpnessValid_)
+			sharedStats_->sharpness = stats_.size() ? stats_[0].sharpness : 0;
 	}
 
+	sharedStats_->sharpnessValid = sharpnessThisFrame_ || imageSharpnessValid_;
 	sharedStats_->valid = valid;
+	sharpnessThisFrame_ = false;
 	statsReady.emit(frame, bufferId);
 }
 
@@ -595,6 +600,131 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
 }
 
 /**
+ * \brief Measure how sharp the frame is, for the autofocus search
+ * \param[in] in The frame to process
+ *
+ * Autofocus needs one number per frame that peaks when the lens is in focus.
+ * This uses the Tenengrad function, the sum of the squared horizontal and
+ * vertical Sobel responses, which is what hardware autofocus engines measure
+ * too, and it reacts strongly to the couple of pixels of blur that defocus
+ * produces on a 13 MP sensor.
+ *
+ * Each sample is the average of one 2x2 Bayer cell, which matters for two
+ * reasons: it mixes the colours away (sampling the raw pattern directly turns
+ * the colour filter array into a checkerboard of gradients that has nothing to
+ * do with focus), and it averages the sensor noise down, so that a frame taken
+ * at high gain does not look sharper than a well-exposed one.  The metric is
+ * normalised by the square of the mean level so that the AGC changing the
+ * exposure during a search does not look like focus either.
+ *
+ * The patch is measured at full resolution: defocus blurs detail by only a
+ * pixel or two, so downsampling the frame first throws the signal away.
+ */
+void SwStatsCpu::calculateSharpness(MappedFrameBuffer &in)
+{
+	if (!stats_.size())
+		return;
+
+	SwIspStats &stats = stats_[0];
+	const uint8_t *src = in.planes()[0].data();
+
+	const unsigned int width = std::min(window_.width, 1600u) & ~3u;
+	const unsigned int height = std::min(window_.height, 1200u) & ~1u;
+	const unsigned int x0 = (window_.x + (window_.width - width) / 2) & ~3u;
+	const unsigned int y0 = (window_.y + (window_.height - height) / 2) & ~1u;
+	const unsigned int cols = width / 2;	/* cells */
+	const unsigned int rows = height / 2;	/* cells */
+	const unsigned int groups = width / 4;	/* four pixels per five bytes */
+
+	if (cols < 3 || rows < 3 || groups < 2) {
+		stats.sharpness = 0;
+		return;
+	}
+
+	sharpness_.resize(rows * cols);
+
+	uint64_t sum = 0;
+
+	for (unsigned int row = 0; row < rows; row++) {
+		const uint8_t *l0 = src + (y0 + row * 2) * stride_ + (x0 / 4) * 5;
+		const uint8_t *l1 = l0 + stride_;
+
+		for (unsigned int g = 0; g < groups; g++) {
+			const uint8_t *a = l0 + g * 5;
+			const uint8_t *b = l1 + g * 5;
+
+			/* Two cells out of one five-byte group per row. */
+			uint16_t c00 = a[0] | ((a[4] & 0x3) << 8);
+			uint16_t c01 = a[1] | (((a[4] >> 2) & 0x3) << 8);
+			uint16_t c10 = b[0] | ((b[4] & 0x3) << 8);
+			uint16_t c11 = b[1] | (((b[4] >> 2) & 0x3) << 8);
+			uint16_t value = (c00 + c01 + c10 + c11) / 4;
+
+			sharpness_[row * cols + g * 2] = value;
+			sum += value;
+
+			c00 = a[2] | (((a[4] >> 4) & 0x3) << 8);
+			c01 = a[3] | (((a[4] >> 6) & 0x3) << 8);
+			c10 = b[2] | (((b[4] >> 4) & 0x3) << 8);
+			c11 = b[3] | (((b[4] >> 6) & 0x3) << 8);
+			value = (c00 + c01 + c10 + c11) / 4;
+
+			sharpness_[row * cols + g * 2 + 1] = value;
+			sum += value;
+		}
+	}
+
+	const uint64_t n = static_cast<uint64_t>(rows) * cols;
+
+	if (!n || !sum) {
+		stats.sharpness = 0;
+		return;
+	}
+
+	const uint64_t mean = sum / n;
+	uint64_t tenengrad = 0;
+
+	for (unsigned int row = 1; row + 1 < rows; row++) {
+		for (unsigned int col = 1; col + 1 < cols; col++) {
+			const unsigned int i = row * cols + col;
+			const int tl = sharpness_[i - cols - 1], tc = sharpness_[i - cols];
+			const int tr = sharpness_[i - cols + 1];
+			const int ml = sharpness_[i - 1], mr = sharpness_[i + 1];
+			const int bl = sharpness_[i + cols - 1], bc = sharpness_[i + cols];
+			const int br = sharpness_[i + cols + 1];
+
+			const int gx = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+			const int gy = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
+
+			tenengrad += static_cast<uint64_t>(gx * gx) + gy * gy;
+		}
+	}
+
+	const uint64_t count = (rows - 2) * (cols - 2);
+
+	stats.sharpness = mean ? tenengrad * 1000 / (count * mean * mean) : 0;
+	LOG(SwStatsCpu, Debug)
+		<< "sharpness " << stats.sharpness << " (" << cols << "x" << rows
+		<< " cells, mean " << mean << ")";
+}
+
+/**
+ * \brief Publish a sharpness value measured by the debayer
+ * \param[in] value Normalised sharpness, in the same units as the statistics
+ *            pass produces
+ */
+void SwStatsCpu::setSharpness(uint64_t value, uint32_t meanY, uint32_t noise,
+			      uint32_t frames)
+{
+	sharedStats_->sharpness = value;
+	sharedStats_->meanY = meanY;
+	sharedStats_->noise = noise;
+	sharedStats_->fvFrames = frames;
+	sharedStats_->sharpnessValid = true;
+	imageSharpnessValid_ = true;
+}
+
+/**
  * \brief Calculate statistics for a frame in one go
  * \param[in] frame The frame number
  * \param[in] bufferId ID of the statistics buffer
@@ -605,6 +735,17 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
 void SwStatsCpu::processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input)
 {
 	if (frame % kStatPerNumFrames) {
+		/*
+		 * Autofocus wants a measurement per frame, it cannot step the lens
+		 * once per statistics interval or the search crawls.  The sharpness
+		 * costs little next to the full statistics pass, so measure it here
+		 * and leave everything else alone.
+		 */
+		if (wantSharpness_) {
+			startFrame(frame);
+			calculateSharpness(input);
+			sharpnessThisFrame_ = true;
+		}
 		finishFrame(frame, bufferId);
 		return;
 	}
@@ -612,6 +753,10 @@ void SwStatsCpu::processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuff
 	bench_.startFrame();
 	startFrame(frame);
 	(this->*processFrame_)(input);
+	if (wantSharpness_) {
+		calculateSharpness(input);
+		sharpnessThisFrame_ = true;
+	}
 	finishFrame(frame, bufferId);
 	bench_.finishFrame();
 }

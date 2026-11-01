@@ -69,6 +69,19 @@ private:
 	int getShaderVariableLocations();
 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
 	void setYUYVShaderVariableValues(eGLImage &eGLImageIn);
+	void measureSharpness(FrameBuffer *output);
+	int buildFvImage(Span<uint8_t> data);
+
+	/* Downsampled grey frame kept for temporal averaging and noise */
+	static constexpr unsigned int kFvCols = 320;
+	static constexpr unsigned int kFvRows = 240;
+	static constexpr unsigned int kFvFrames = 5;
+	std::array<std::array<uint8_t, kFvCols * kFvRows>, kFvFrames> fvHistory_;
+	std::array<uint8_t, kFvCols * kFvRows> fvAverage_;
+	unsigned int fvIndex_ = 0;
+	unsigned int fvCount_ = 0;
+	uint32_t fvNoise_ = 4;		/* sane default before the first estimate */
+	uint32_t fvMean_ = 0;
 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
 	int rgbToYUYV(eGLImage &eglImageOut, eGLImage &eglImageIn,
 		      const DebayerParams &params);

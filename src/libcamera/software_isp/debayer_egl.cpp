@@ -10,6 +10,7 @@
 #include "debayer_egl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <assert.h>
 #include <memory>
@@ -669,6 +670,157 @@ void DebayerEGL::setYUYVShaderVariableValues(eGLImage &eglImageIn)
 			   kIdentityMatrix);
 }
 
+/**
+ * \brief Measure the sharpness of the debayered image in the centre region
+ * \param[in] output The frame that was just rendered
+ */
+void DebayerEGL::measureSharpness(FrameBuffer *output)
+{
+	MappedFrameBuffer mapped(output, MappedFrameBuffer::MapFlag::Read);
+	if (!mapped.isValid())
+		return;
+
+	if (buildFvImage(mapped.planes()[0]) < 0)
+		return;
+
+	/*
+	 * FV is measured on the temporal average of the last kFvFrames frames:
+	 * averaging is what makes the metric repeatable in low light, where a
+	 * single frame is dominated by sensor noise.
+	 */
+	const unsigned int n = fvAverage_.size();
+	const unsigned int frames = std::min(fvCount_, kFvFrames);
+	std::array<uint8_t, kFvCols * kFvRows> &prev = fvHistory_[(fvIndex_ + kFvFrames - 1) % kFvFrames];
+
+	/* Noise: standard deviation of the frame to frame difference */
+	uint64_t diffSum = 0;
+	uint64_t lumaSum = 0;
+	for (unsigned int i = 0; i < n; i++) {
+		const int d = static_cast<int>(prev[i]) - static_cast<int>(fvAverage_[i]);
+		diffSum += static_cast<uint64_t>(d * d);
+		lumaSum += fvAverage_[i];
+	}
+
+	const uint64_t mean = lumaSum / n;
+	fvMean_ = mean;
+	/*
+	 * For two independent frames the variance of the difference is twice the
+	 * per frame variance, hence the division by two.
+	 *
+	 * The estimate is smoothed over frames: it sets the gradient threshold,
+	 * and a threshold that jumps around changes how many gradients pass it,
+	 * which shows up as a large spread in the focus value itself.
+	 */
+	/*
+	 * The noise estimate drives the gradient threshold, so it must not be
+	 * taken from a window that was just restarted: with a single frame in
+	 * it the difference to the average is zero, the threshold collapses and
+	 * every noise gradient is counted as detail - which reads as an
+	 * extremely sharp picture exactly when the lens moved.
+	 */
+	if (frames >= kFvFrames) {
+		const uint32_t noise = static_cast<uint32_t>(std::sqrt(diffSum / (2.0 * n)));
+		fvNoise_ = fvNoise_ ? (fvNoise_ * 3 + noise) / 4 : noise;
+	}
+
+	/*
+	 * Gradients below the noise floor carry no focus information, and
+	 * saturated pixels are clipped so their gradients are artefacts.
+	 */
+	const int threshold = std::max(2, static_cast<int>(fvNoise_ * 2.5));
+	const int threshold2 = threshold * threshold;
+
+	uint64_t sum = 0;
+	unsigned int count = 0;	/* grid points, including the flat ones */
+
+	for (unsigned int r = 1; r + 1 < kFvRows; r++) {
+		const uint8_t *r0 = &fvAverage_[(r - 1) * kFvCols];
+		const uint8_t *r1 = &fvAverage_[r * kFvCols];
+		const uint8_t *r2 = &fvAverage_[(r + 1) * kFvCols];
+
+		for (unsigned int c = 1; c + 1 < kFvCols; c++) {
+			if (r1[c] > 250)
+				continue;
+
+			count++;
+
+			const int gx = static_cast<int>(r1[c + 1]) - r1[c - 1];
+			const int gy = static_cast<int>(r2[c]) - r0[c];
+			const int mag = gx * gx + gy * gy;
+
+			if (mag <= threshold2)
+				continue;
+
+			/*
+			 * Soft threshold: taking the noise floor out of every
+			 * gradient keeps the value from stepping as gradients cross
+			 * the threshold from one frame to the next.
+			 */
+			sum += mag - threshold2;
+		}
+	}
+
+	if (!count)
+		return;
+
+	/*
+	 * Normalise by the squared mean level so that the value describes the
+	 * picture's detail and not its brightness: the AE keeps moving the
+	 * exposure, and an autofocus record that scales with it is worthless.
+	 * The floor keeps a dark frame, where the mean approaches zero, from
+	 * blowing the ratio up.
+	 */
+	const uint64_t luma = std::max<uint64_t>(fvMean_, 32);
+	const uint64_t sharpness = sum * 100000 / (count * luma * luma);
+
+	stats_->setSharpness(sharpness, fvMean_, fvNoise_,
+			     std::min(fvCount_, kFvFrames));
+}
+
+/*
+ * Downsample the frame into the history ring and rebuild the temporal average.
+ * Returns 0 on success.
+ */
+int DebayerEGL::buildFvImage(Span<uint8_t> data)
+{
+	const unsigned int stride = outputConfig_.stride;
+	const bool yuyv = outputPixelFormat_ == formats::YUYV;
+	const unsigned int bpp = yuyv ? 2 : 4;
+	const unsigned int green = yuyv ? 0 : 1;
+
+	const unsigned int width = outputSize_.width;
+	const unsigned int height = outputSize_.height;
+	const unsigned int xStep = std::max(1u, width / kFvCols);
+	const unsigned int yStep = std::max(1u, height / kFvRows);
+	const unsigned int cols = std::min(kFvCols, width / xStep);
+	const unsigned int rows = std::min(kFvRows, height / yStep);
+	if (cols < 3 || rows < 3)
+		return -1;
+
+	std::array<uint8_t, kFvCols * kFvRows> &slot = fvHistory_[fvIndex_];
+	slot.fill(0);
+
+	for (unsigned int r = 0; r < rows; r++) {
+		const uint8_t *row = data.data() + static_cast<size_t>(r * yStep) * stride;
+		for (unsigned int c = 0; c < cols; c++)
+			slot[r * kFvCols + c] = row[(c * xStep) * bpp + green];
+	}
+
+	fvIndex_ = (fvIndex_ + 1) % kFvFrames;
+	if (fvCount_ < kFvFrames)
+		fvCount_++;
+
+	/* Average whatever history there is. */
+	fvAverage_.fill(0);
+	for (unsigned int f = 0; f < fvCount_; f++) {
+		const std::array<uint8_t, kFvCols * kFvRows> &frame = fvHistory_[f];
+		for (unsigned int i = 0; i < fvAverage_.size(); i++)
+			fvAverage_[i] += frame[i] / fvCount_;
+	}
+
+	return 0;
+}
+
 eGLImage *DebayerEGL::getCachedInputFrameBuffer(FrameBuffer *input, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer)
 {
 	const SharedFD &fd = input->planes()[0].fd;
@@ -886,6 +1038,23 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
 	inDmaSyncer.reset();
 
 	egl_.syncOutput();
+
+	/*
+	 * Measure the focus sharpness on the image that leaves the ISP, in the
+	 * centre of the frame, the way an application would: statistics taken
+	 * from the raw Bayer frame are far noisier in low light, which makes an
+	 * autofocus search lock onto noise.
+	 */
+	if (params.wantSharpness) {
+		if (params.resetSharpness) {
+			fvIndex_ = 0;
+			fvCount_ = 0;
+		}
+		measureSharpness(output);
+	} else {
+		stats_->setWantSharpness(false);
+	}
+
 	bench_.finishFrame();
 
 	outputBufferReady.emit(output);

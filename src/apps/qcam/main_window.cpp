@@ -362,26 +362,50 @@ void MainWindow::autoFocus()
 		return imageSharpness(viewfinder_->getCurrentImage());
 	};
 
-	double bestScore = -1.0;
-	for (int value = lo; value <= hi; value += coarse) {
-		const double score = measure(value);
-		if (score > bestScore) {
-			bestScore = score;
-			best = value;
-		}
+	/*
+	 * One continuous path for the whole search: every move is a single step,
+	 * with no jump anywhere, and the lens changes direction only at the ends.
+	 *
+	 *   current -> lo        walk down from wherever the lens is
+	 *   lo -> hi             the coarse sweep itself, ascending
+	 *   hi -> best - coarse  walk down to just below the best position
+	 *   best - coarse -> best + coarse   fine sweep, ascending
+	 *
+	 * Constant-size steps matter for more than tidiness: the actuator is open
+	 * loop, and a step much larger than the previous one yanks the coil hard
+	 * enough that the lens overshoots and knocks against its stop.
+	 */
+	int current = lo;
+	{
+		struct v4l2_control ctrl = { V4L2_CID_FOCUS_ABSOLUTE, 0 };
+		if (::ioctl(fd, VIDIOC_G_CTRL, &ctrl) == 0)
+			current = std::clamp(ctrl.value, lo, hi);
 	}
 
-	/* Refine, one coarse step either side of the best position found. */
-	const int step = coarse / 4 ? coarse / 4 : 1;
-	const int from = std::max(lo, best - coarse);
-	const int to = std::min(hi, best + coarse);
-	for (int value = from; value <= to; value += step) {
-		const double score = measure(value);
-		if (score > bestScore) {
-			bestScore = score;
-			best = value;
+	double bestScore = -1.0;
+
+	auto walk = [&](int from, int to, int step) {
+		if (step < 1)
+			step = 1;
+		const int dir = to >= from ? step : -step;
+		for (int value = from; dir > 0 ? value <= to : value >= to; value += dir) {
+			const double score = measure(value);
+			if (score > bestScore) {
+				bestScore = score;
+				best = value;
+			}
 		}
-	}
+	};
+
+	/* Down to the near end, then the coarse sweep up to the far end. */
+	walk(current, lo, coarse);
+	walk(lo, hi, coarse);
+
+	/* Back down to just below the best, then refine upwards through it. */
+	const int fine = coarse / 4 ? coarse / 4 : 1;
+	const int span = std::max(lo, best - coarse);
+	walk(hi, span, coarse);
+	walk(span, std::min(hi, best + coarse), fine);
 
 	setLensFocus(fd, best);
 	::close(fd);

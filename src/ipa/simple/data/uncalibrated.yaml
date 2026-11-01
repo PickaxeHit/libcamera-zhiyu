@@ -3,6 +3,7 @@
 ---
 version: 1
 algorithms:
+  - Af:
   - BlackLevel:
   - Awb:
   # Color correction matrices can be defined here. The CCM algorithm

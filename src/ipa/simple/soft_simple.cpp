@@ -341,6 +341,7 @@ void IPASoftSimple::computeParams(const uint32_t frame)
 		params_->lscEnabled = true;
 	}
 
+	/* Ask the statistics pass for the sharpness autofocus needs. */
 	setIspParams.emit();
 }
 
@@ -356,6 +357,8 @@ void IPASoftSimple::processStats(const uint32_t frame,
 	frameContext.sensor.gain = camHelper_ ? camHelper_->gain(again) : again;
 
 	ControlList metadata(controls::controls);
+	LOG(IPASoft, Debug)
+		<< "frame " << frame << " sharpness " << stats_->sharpness;
 	for (const auto &algo : algorithms())
 		algo->process(context_, frame, frameContext, stats_, metadata);
 	metadataReady.emit(frame, metadata);
@@ -374,7 +377,14 @@ void IPASoftSimple::processStats(const uint32_t frame,
 	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
 		  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(againNew) : againNew));
 
-	setSensorControls.emit(ctrls);
+	/*
+	 * The focus actuator is not programmed from here: its V4L2 control id
+	 * only resolves in the pipeline's control info map, so the AF reports
+	 * the lens position as libcamera metadata instead and the pipeline
+	 * applies it.
+	 */
+	ControlList lensCtrls;
+	setSensorControls.emit(ctrls, lensCtrls);
 }
 
 std::string IPASoftSimple::logPrefix() const

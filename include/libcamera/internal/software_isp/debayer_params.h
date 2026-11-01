@@ -36,6 +36,22 @@ struct DebayerParams {
 	float gamma = 1.0;
 	float contrastExp = 1.0;
 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
+
+	/*
+	 * Ask the statistics pass to measure the frame's sharpness.  It costs a
+	 * few milliseconds per frame, so it is only enabled while an autofocus
+	 * search is running.
+	 */
+	bool wantSharpness = false;
+
+	/**
+	 * Discard the frames collected so far for the sharpness measurement.
+	 *
+	 * Set for the frames right after the lens moved: the temporal average
+	 * must not mix frames taken at two different lens positions, or the
+	 * measurement reports a large spread instead of a value.
+	 */
+	bool resetSharpness = false;
 };
 
 } /* namespace libcamera */

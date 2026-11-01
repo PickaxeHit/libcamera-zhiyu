@@ -52,6 +52,11 @@ public:
 
 	const Size &patternSize() { return patternSize_; }
 
+	void setWantSharpness(bool enable) { wantSharpness_ = enable; if (!enable) imageSharpnessValid_ = false; }
+	/* Publish a sharpness measured elsewhere, e.g. on the debayered image. */
+	void setSharpness(uint64_t value, uint32_t meanY = 0, uint32_t noise = 0,
+			  uint32_t frames = 0);
+
 	int configure(const StreamConfiguration &inputCfg, unsigned int statsBufferCount = 1);
 	void setWindow(const Rectangle &window);
 	void startFrame(uint32_t frame);
@@ -103,6 +108,7 @@ private:
 	void statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats);
 
 	void processBayerFrame2(MappedFrameBuffer &in);
+	void calculateSharpness(MappedFrameBuffer &in);
 
 	processFrameFn processFrame_;
 
@@ -117,9 +123,15 @@ private:
 
 	Size patternSize_;
 
+	bool wantSharpness_ = false;
+	bool sharpnessThisFrame_ = false;
+	bool imageSharpnessValid_ = false;
+
 	unsigned int xShift_;
 	unsigned int stride_;
 	unsigned int sumShift_;
+
+	std::vector<uint16_t> sharpness_;
 
 	std::vector<SwIspStats> stats_;
 	SharedMemObject<SwIspStats> sharedStats_;

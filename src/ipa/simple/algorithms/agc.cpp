@@ -56,10 +56,22 @@ static constexpr float kExposureSatisfactory = 0.2;
 static constexpr float kExpProportionalGain = 0.04;
 
 /*
+ * While the exposure is still far from the target the proportional term above
+ * is far too gentle: a dark room needs a tenfold change, and 15 % per frame
+ * takes more than a second of 30 fps frames to get there - the picture visibly
+ * crawls out of the dark.  Use a much stronger gain and step while the error is
+ * above this threshold, and keep the gentle values for the last bit of the
+ * approach so the exposure still settles without oscillating.
+ */
+static constexpr float kExpFarThreshold = 0.7;
+static constexpr float kExpFastGain = 0.45;
+
+/*
  * Maximum multiplicative step per frame, to bound the correction when the
  * scene changes dramatically.
  */
 static constexpr float kExpMaxStep = 0.15;
+static constexpr float kExpFastMaxStep = 0.9;
 
 Agc::Agc()
 	: target_(kExposureOptimal)
@@ -97,8 +109,11 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
 	 * determines the direction: positive error means too dark (increase),
 	 * negative means too bright (decrease).
 	 */
-	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain,
-				-kExpMaxStep, kExpMaxStep);
+	const bool far = std::abs(error) > kExpFarThreshold;
+	const float gain = far ? kExpFastGain : kExpProportionalGain;
+	const float maxStep = far ? kExpFastMaxStep : kExpMaxStep;
+	float step = std::clamp(static_cast<float>(error) * gain,
+				-maxStep, maxStep);
 	float factor = 1.0f + step;
 
 	if (factor > 1.0f) {
@@ -160,6 +175,17 @@ void Agc::process(IPAContext &context,
 		context.activeState.agc.exposure = frameContext.sensor.exposure;
 		context.activeState.agc.again = frameContext.sensor.gain;
 		context.activeState.agc.valid = true;
+	}
+
+	/*
+	 * An autofocus search needs a constant exposure: if the AE keeps
+	 * adjusting while the lens moves, the focus metric follows the exposure
+	 * instead of the focus.
+	 */
+	if (context.configuration.freezeAe) {
+		frameContext.sensor.exposure = context.activeState.agc.exposure;
+		frameContext.sensor.gain = context.activeState.agc.again;
+		return;
 	}
 
 	if (!stats->valid) {

@@ -7,7 +7,6 @@
  */
 
 #include <algorithm>
-#include <cstdlib>
 #include <iterator>
 #include <list>
 #include <map>
@@ -16,6 +15,7 @@
 #include <queue>
 #include <set>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <unordered_map>
@@ -35,9 +35,7 @@
 
 #include "libcamera/internal/camera.h"
 #include "libcamera/internal/camera_manager.h"
-#include "libcamera/internal/camera_lens.h"
 #include "libcamera/internal/camera_sensor.h"
-#include "libcamera/internal/mapped_framebuffer.h"
 #include "libcamera/internal/camera_sensor_properties.h"
 #include "libcamera/internal/converter.h"
 #include "libcamera/internal/delayed_controls.h"
@@ -276,264 +274,49 @@ bool isRaw(const StreamConfiguration &cfg)
 	       libcamera::PixelFormatInfo::ColourEncodingRAW;
 }
 
-} /* namespace */
-
 /*
- * Contrast-detect autofocus, for cameras whose lens is a plain V4L2
- * sub-device.  It samples the raw frames at the sensor's own resolution,
- * measures high-frequency content, and walks the lens over its range to
- * find the peak.
+ * Return the I2C adapter a V4L2 sub-device hangs off, for example
+ * "/sys/devices/platform/ac7b000.cci/i2c-4" for a device bound at "4-0036".
  *
- * The lens is open loop, so the search is the only way to know where the
- * focus is; the measurement is normalised by the frame's mean level so that
- * the exposure control, which is still settling while the sweep runs, does
- * not masquerade as focus.
+ * It is used to tell which focus lens belongs to which sensor: the actuator
+ * and the sensor of a camera module share one adapter, so the adapter path is
+ * what ties them together.  An empty string is returned when the path cannot
+ * be resolved, for instance for a sub-device that is not an I2C client.
  */
-class SimpleAutofocus
+std::string subdevI2cAdapter(const MediaEntity *entity)
 {
-public:
-	void attach(CameraSensor *sensor)
-	{
-		lens_ = sensor ? sensor->focusLens() : nullptr;
-		if (!lens_)
-			return;
+	const std::string &node = entity->deviceNode();
+	if (node.empty())
+		return {};
 
-		const ControlInfoMap &ctrls = lens_->controls();
-		auto it = ctrls.find(V4L2_CID_FOCUS_ABSOLUTE);
-		if (it == ctrls.end()) {
-			LOG(SimplePipeline, Info)
-				<< "Lens " << lens_->model()
-				<< " has no focus control, autofocus disabled";
-			lens_ = nullptr;
-			return;
-		}
+	/* /dev/v4l-subdevN -> /sys/class/video4linux/v4l-subdevN/device */
+	const std::string link = "/sys/class/video4linux/" +
+				 node.substr(node.rfind('/') + 1) + "/device";
 
-		min_ = it->second.min().get<int32_t>();
-		max_ = it->second.max().get<int32_t>();
+	char *resolved = realpath(link.c_str(), nullptr);
+	if (!resolved)
+		return {};
 
-		LOG(SimplePipeline, Info)
-			<< "Autofocus on lens " << lens_->model()
-			<< ", positions " << min_ << ".." << max_;
-	}
+	std::string client(resolved);
+	free(resolved);
 
-	void configure(const Size &size, unsigned int stride)
-	{
-		size_ = size;
-		stride_ = stride;
-	}
+	/* Drop the client address to land on the adapter the clients live on */
+	std::string::size_type pos = client.rfind('/');
+	if (pos == std::string::npos)
+		return {};
 
-	void start()
-	{
-		if (!lens_)
-			return;
+	return client.substr(0, pos);
+}
 
-		frames_ = 0;
-		step_ = 0;
-		bestScore_ = 0;
-		bestPos_ = min_;
-		lowCount_ = 0;
-
-		steps_.clear();
-		unsigned int n = 16;
-		for (unsigned int i = 0; i <= n; i++)
-			steps_.push_back(min_ + (max_ - min_) * i / n);
-
-		state_ = State::Sweep;
-		move(steps_[0]);
-	}
-
-	void process(const FrameBuffer *buffer)
-	{
-		if (!lens_ || state_ == State::Off)
-			return;
-
-		/* Let the exposure control settle before measuring anything. */
-		if (frames_ < 8) {
-			frames_++;
-			return;
-		}
-
-		if (settle_) {
-			settle_--;
-			return;
-		}
-
-		const double score = measure(buffer);
-
-		LOG(SimplePipeline, Debug)
-			<< "Autofocus position " << steps_[step_]
-			<< " score " << score;
-
-		switch (state_) {
-		case State::Sweep:
-		case State::Refine:
-			if (score > bestScore_ && score > 0.0) {
-				bestScore_ = score;
-				bestPos_ = steps_[step_];
-			}
-
-			if (++step_ < steps_.size()) {
-				move(steps_[step_]);
-				break;
-			}
-
-			if (state_ == State::Sweep) {
-				refineAround(bestPos_);
-			} else {
-				state_ = State::Locked;
-				lockScore_ = bestScore_;
-				move(bestPos_);
-				LOG(SimplePipeline, Info)
-					<< "Autofocus locked at " << bestPos_
-					<< " (score " << bestScore_ << ")";
-			}
-			break;
-
-		case State::Locked:
-			/*
-			 * Something changed: the scene, or the distance.  Look
-			 * again around the current position, which is much
-			 * cheaper than a full sweep.
-			 */
-			if (lockScore_ > 0.0 && score < lockScore_ * 0.6) {
-				if (++lowCount_ > 3) {
-					lowCount_ = 0;
-					refineAround(bestPos_);
-				}
-			} else {
-				lowCount_ = 0;
-			}
-			break;
-
-		default:
-			break;
-		}
-	}
-
-private:
-	enum class State { Off, Sweep, Refine, Locked };
-
-	void move(int position)
-	{
-		int ret = lens_->setFocusPosition(position);
-		if (ret)
-			LOG(SimplePipeline, Warning)
-				<< "Failed to set focus position " << position;
-		/* One frame to let the lens settle before measuring. */
-		settle_ = 2;
-	}
-
-	void refineAround(int centre)
-	{
-		const int coarse = (max_ - min_) / 16;
-		const int step = coarse > 4 ? coarse / 4 : 1;
-
-		steps_.clear();
-		for (int pos = centre - coarse; pos <= centre + coarse; pos += step)
-			steps_.insert(steps_.end(), std::clamp(pos, min_, max_));
-
-		step_ = 0;
-		bestScore_ = 0;
-		state_ = State::Refine;
-		move(steps_[0]);
-	}
-
-	/*
-	 * High-frequency content of the raw frame, divided by its mean level:
-	 * a defocused frame loses contrast, a brighter frame does not gain
-	 * apparent sharpness.
-	 */
-	double measure(const FrameBuffer *buffer) const
-	{
-		MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
-		if (!map.isValid())
-			return 0.0;
-
-		const Span<uint8_t> &plane = map.planes()[0];
-		const uint8_t *base = plane.data();
-		const unsigned long long length = plane.size();
-		const unsigned int stride = stride_ ? stride_ : 4 * size_.width;
-		const unsigned int step = 4;
-
-		if (!stride || !length || !size_.width || !size_.height)
-			return 0.0;
-
-		const unsigned int width = size_.width / step;
-
-		/*
-		 * Variance of the Laplacian of a subsampled greyscale copy:
-		 * high when the image has strong edges, low when the lens is
-		 * out of focus.  Measured after the ISP, on the same frames the
-		 * application receives, which is where the metric was found to
-		 * track the lens position.
-		 */
-		std::vector<uint8_t> grey;
-		grey.reserve(static_cast<size_t>(width) * (size_.height / step));
-
-		for (unsigned int y = 0; y < size_.height; y += step) {
-			const unsigned long long offset = (unsigned long long)y * stride;
-			if (offset + stride > length)
-				break;
-
-			const uint8_t *row = base + offset;
-			for (unsigned int x = 0; x < size_.width; x += step) {
-				const uint8_t *px = row + x * 4;
-				grey.push_back((px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8);
-			}
-		}
-
-		const unsigned int rows = width ? grey.size() / width : 0;
-		if (rows < 3)
-			return 0.0;
-
-		double sum = 0.0, sum2 = 0.0;
-		unsigned long long n = 0;
-
-		for (unsigned int y = 1; y < rows - 1; y++) {
-			const uint8_t *r0 = &grey[(y - 1) * width];
-			const uint8_t *r1 = &grey[y * width];
-			const uint8_t *r2 = &grey[(y + 1) * width];
-
-			for (unsigned int x = 1; x < width - 1; x++) {
-				const double lap = -4.0 * r1[x] + r0[x] + r2[x]
-						   + r1[x - 1] + r1[x + 1];
-				sum += lap;
-				sum2 += lap * lap;
-				n++;
-			}
-		}
-
-		if (!n)
-			return 0.0;
-
-		const double mean = sum / n;
-		return sum2 / n - mean * mean;
-	}
-
-	CameraLens *lens_ = nullptr;
-	State state_ = State::Off;
-	Size size_;
-	unsigned int stride_ = 0;
-
-	std::vector<int> steps_;
-	unsigned int step_ = 0;
-	unsigned int settle_ = 0;
-	unsigned int frames_ = 0;
-
-	int min_ = 0;
-	int max_ = 0;
-	int bestPos_ = 0;
-	double bestScore_ = 0;
-	double lockScore_ = 0;
-	unsigned int lowCount_ = 0;
-};
+} /* namespace */
 
 class SimpleCameraData : public Camera::Private
 {
 public:
 	SimpleCameraData(SimplePipelineHandler *pipe,
 			 unsigned int numStreams,
-			 MediaEntity *sensor);
+			 MediaEntity *sensor,
+			 MediaEntity *lens);
 
 	bool isValid() const { return sensor_ != nullptr; }
 	SimplePipelineHandler *pipe();
@@ -594,7 +377,14 @@ public:
 	 */
 	std::list<Entity> entities_;
 	std::unique_ptr<CameraSensor> sensor_;
-	SimpleAutofocus af_;
+	/*
+	 * The focus lens, if the camera has one.  It is a plain V4L2 sub-device
+	 * with no media links (the actuator does not carry data), so it is found
+	 * by its entity function rather than by walking the graph from the
+	 * sensor.
+	 */
+	std::unique_ptr<V4L2Subdevice> lens_;
+	MediaEntity *lensEntity_;
 	V4L2VideoDevice *video_;
 	V4L2Subdevice *frameStartEmitter_;
 
@@ -625,7 +415,9 @@ private:
 
 	void ispStatsReady(uint32_t frame, uint32_t bufferId);
 	void metadataReady(uint32_t frame, const ControlList &metadata);
-	void setSensorControls(const ControlList &sensorControls);
+	void moveLens(const ControlList &metadata);
+	void setSensorControls(const ControlList &sensorControls,
+			       const ControlList &lensControls);
 };
 
 class SimpleCameraConfiguration : public CameraConfiguration
@@ -722,8 +514,10 @@ private:
 
 SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
 				   unsigned int numStreams,
-				   MediaEntity *sensor)
-	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr)
+				   MediaEntity *sensor,
+				   MediaEntity *lens)
+	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr),
+	  lensEntity_(lens)
 {
 	/*
 	 * Find the shortest path from the camera sensor to a video capture
@@ -880,6 +674,19 @@ int SimpleCameraData::init()
 			swIsp_->ispStatsReady.connect(this, &SimpleCameraData::ispStatsReady);
 			swIsp_->metadataReady.connect(this, &SimpleCameraData::metadataReady);
 			swIsp_->setSensorControls.connect(this, &SimpleCameraData::setSensorControls);
+		}
+	}
+
+	if (lensEntity_) {
+		lens_ = std::make_unique<V4L2Subdevice>(lensEntity_);
+		if (lens_->open() != 0) {
+			lens_.reset();
+		} else {
+			LOG(SimplePipeline, Debug)
+				<< "Using " << lensEntity_->name()
+				<< " as the focus lens";
+			/* Do not hold it open (and powered) while idle. */
+			lens_->close();
 		}
 	}
 
@@ -1272,8 +1079,6 @@ void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
 {
 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
 
-	af_.process(buffer);
-
 	/* Complete the buffer and the request. */
 	Request *request = buffer->request();
 	if (pipe->completeBuffer(request, buffer))
@@ -1286,8 +1091,53 @@ void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId)
 			     delayedCtrls_->get(frame));
 }
 
+/*
+ * rief Programme the focus actuator with the position the IPA asked for
+ * \param[in] metadata The metadata produced by the IPA for the frame
+ *
+ * The IPA reports an absolute lens position normalised to the actuator's
+ * travel.  Applying it is the pipeline's job: the V4L2 control id of the
+ * actuator only exists in this process's control info map.
+ */
+void SimpleCameraData::moveLens(const ControlList &metadata)
+{
+	if (!lens_)
+		return;
+
+	const std::optional<float> position = metadata.get(controls::LensPosition);
+	if (!position)
+		return;
+
+	const ControlInfoMap &lensControls = lens_->controls();
+	const auto it = lensControls.find(V4L2_CID_FOCUS_ABSOLUTE);
+	if (it == lensControls.end())
+		return;
+
+	const int32_t min = it->second.min().get<int32_t>();
+	const int32_t max = it->second.max().get<int32_t>();
+	const int32_t hw = static_cast<int32_t>(min + (max - min) * position.value() + 0.5f);
+
+	ControlList ctrls(lensControls);
+	/* ControlList::set() inserts the control when it is not present yet. */
+	ctrls.set(V4L2_CID_FOCUS_ABSOLUTE, hw);
+
+	int ret = lens_->setControls(&ctrls);
+	if (ret)
+		LOG(SimplePipeline, Error)
+			<< "Failed to set lens position to " << hw << ": " << ret;
+}
+
 void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata)
 {
+	/*
+	 * The autofocus in the IPA reports the lens position it wants as a
+	 * libcamera control.  Programming the actuator is left to the pipeline,
+	 * which owns the lens sub-device: a V4L2 control id cannot be carried
+	 * through a ControlList built by the IPA, because the map of V4L2 ids
+	 * lives on this side of the IPA boundary.
+	 */
+	moveLens(metadata);
+
 	SimpleFrameInfo *info = frameInfo_.find(frame);
 	if (!info)
 		return;
@@ -1297,8 +1147,17 @@ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata
 	tryCompleteRequest(info->request);
 }
 
-void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+void SimpleCameraData::setSensorControls(const ControlList &sensorControls,
+					 const ControlList &lensControls)
 {
+	if (lens_ && !lensControls.empty()) {
+		ControlList ctrls = lensControls;
+		int ret = lens_->setControls(&ctrls);
+		if (ret)
+			LOG(SimplePipeline, Error)
+				<< "Failed to set lens controls: " << ret;
+	}
+
 	delayedCtrls_->push(sensorControls);
 	/*
 	 * Directly apply controls now if there is no frameStart signal.
@@ -1822,8 +1681,6 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 		return -EINVAL;
 	}
 
-	data->af_.attach(data->sensor_.get());
-
 	if (requested_bpl && captureFormat.planes[0].bpl != requested_bpl) {
 		LOG(SimplePipeline, Info)
 			<< "Input buffer stride ignored by the driver. "
@@ -1852,9 +1709,6 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 	if (outputCfgs.empty())
 		return 0;
 
-	data->af_.configure(outputCfgs.front().get().size,
-			    outputCfgs.front().get().stride);
-
 	StreamConfiguration inputCfg;
 	inputCfg.pixelFormat = videoFormat.toPixelFormat();
 	inputCfg.size = pipeConfig->captureSize;
@@ -1866,6 +1720,8 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 	} else {
 		ipa::soft::IPAConfigInfo configInfo;
 		configInfo.sensorControls = data->sensor_->controls();
+		if (data->lens_)
+			configInfo.lensControls = data->lens_->controls();
 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
 	}
 }
@@ -1903,6 +1759,17 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 		return -EBUSY;
 	}
 
+	/* The actuator only needs to be powered while frames are streaming. */
+	if (data->lens_) {
+		ret = data->lens_->open();
+		if (ret) {
+			LOG(SimplePipeline, Error)
+				<< "Failed to open the focus lens: " << ret;
+			releasePipeline(data);
+			return ret;
+		}
+	}
+
 	if (data->useConversion_ && !data->rawStream_) {
 		/*
 		 * When using the converter allocate a fixed number of internal
@@ -1937,8 +1804,6 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
 	}
 
 	ret = video->streamOn();
-	if (!ret)
-		data->af_.start();
 	if (ret < 0) {
 		stop(camera);
 		return ret;
@@ -1993,6 +1858,16 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
 	data->frameInfo_.clear();
 	data->clearIncompleteRequests();
 	data->conversionBuffers_.clear();
+
+	/*
+	 * Release the focus lens too: the actuator is powered through the camera
+	 * module's rails, and holding it energised for no reason heats the coil
+	 * and wastes power.  Closing the sub-device suspends it, which is what
+	 * drops the rail.  The lens then relaxes to its rest position, and the
+	 * autofocus search runs again on the next stream.
+	 */
+	if (data->lens_)
+		data->lens_->close();
 
 	releasePipeline(data);
 }
@@ -2186,9 +2061,30 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
 
 	pipelines.reserve(sensors.size());
 
+	/*
+	 * A focus lens is not linked into the media graph (the actuator carries
+	 * no data), so it is picked up by its entity function.  Which camera it
+	 * belongs to has to come from the bus the two sit on: the actuator of a
+	 * camera module is an I2C device on the same CCI/I2C adapter as its
+	 * sensor.  Boards that put several modules on one adapter would need a
+	 * media link or a DT phandle to tell them apart.
+	 */
+	std::map<std::string, MediaEntity *> lenses;
+	for (MediaEntity *entity : media->entities()) {
+		if (entity->function() != MEDIA_ENT_F_LENS ||
+		    entity->deviceNode().empty())
+			continue;
+
+		std::string adapter = subdevI2cAdapter(entity);
+		if (!adapter.empty())
+			lenses[adapter] = entity;
+	}
+
 	for (MediaEntity *sensor : sensors) {
+		const auto lensIt = lenses.find(subdevI2cAdapter(sensor));
+		MediaEntity *lens = lensIt != lenses.end() ? lensIt->second : nullptr;
 		std::unique_ptr<SimpleCameraData> data =
-			std::make_unique<SimpleCameraData>(this, numStreams, sensor);
+			std::make_unique<SimpleCameraData>(this, numStreams, sensor, lens);
 		if (!data->isValid()) {
 			LOG(SimplePipeline, Error)
 				<< "No valid pipeline for sensor '"

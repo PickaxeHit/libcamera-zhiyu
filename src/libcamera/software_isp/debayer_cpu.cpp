@@ -1089,6 +1089,7 @@ void DebayerCpu::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
 		return;
 	}
 
+	stats_->setWantSharpness(params.wantSharpness);
 	stats_->startFrame(frame);
 
 	workPendingMutex_.lock();

@@ -43,6 +43,24 @@ struct SwIspStats {
 	 * \brief A histogram of luminance values of all the sampled pixels
 	 */
 	Histogram yHistogram;
+	/**
+	 * \brief Normalised sharpness of the frame, in parts per thousand of
+	 *        the squared mean level: high when the image has strong edges
+	 *
+	 * Computed only for the frames the IPA asked for it (see
+	 * DebayerParams::wantSharpness); zero otherwise.  Dividing by the mean
+	 * level keeps the value independent of the exposure, which the AGC is
+	 * still changing while an autofocus search runs.
+	 */
+	uint64_t sharpness;
+	/** \brief Whether \a sharpness was measured for this frame */
+	bool sharpnessValid;
+	/** \brief Mean luma level of the frame the sharpness was measured on */
+	uint32_t meanY;
+	/** \brief Estimated sensor noise, in luma units */
+	uint32_t noise;
+	/** \brief Frames averaged into \a sharpness, 0 when stale */
+	uint32_t fvFrames;
 };
 
 } /* namespace libcamera */
