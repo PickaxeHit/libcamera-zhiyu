@@ -65,9 +65,13 @@ private:
 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
+	int initYUYVShaders();
 	int getShaderVariableLocations();
 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
+	void setYUYVShaderVariableValues(eGLImage &eGLImageIn);
 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
+	int rgbToYUYV(eGLImage &eglImageOut, eGLImage &eglImageIn,
+		      const DebayerParams &params);
 
 	eGLImage *getCachedInputFrameBuffer(FrameBuffer *input, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer);
 	eGLImage *getCachedOutputFrameBuffer(FrameBuffer *output);
@@ -76,6 +80,25 @@ private:
 	GLuint vertexShaderId_ = 0;
 	GLuint fragmentShaderId_ = 0;
 	GLuint programId_ = 0;
+
+	/*
+	 * Second pass, RGB in, packed YUYV out. The GPU cannot render into a
+	 * YUYV buffer, so the debayered image is first rendered into
+	 * rgbIntermediate_ and then packed two pixels per output texel.
+	 */
+	GLuint yuyvVertexShaderId_ = 0;
+	GLuint yuyvFragmentShaderId_ = 0;
+	GLuint yuyvProgramId_ = 0;
+	GLint yuyvAttributeVertex_;
+	GLint yuyvAttributeTexture_;
+	GLint yuyvTextureUniformIn_;
+	GLint yuyvTextureUniformStep_;
+	GLint yuyvTextureUniformStrideFactor_;
+	GLint yuyvTextureUniformProjMatrix_;
+	std::unique_ptr<eGLImage> rgbIntermediate_;
+	bool outputIsYUYV_ = false;
+	/* Texels per row of the output image, two YUYV pixels per texel */
+	unsigned int outputImageWidth_;
 
 	/* Pointer to object representing input texture */
 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageInCache_;

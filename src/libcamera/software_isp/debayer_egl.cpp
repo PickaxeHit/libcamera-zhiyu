@@ -37,6 +37,28 @@ namespace libcamera {
  * Implements an EGL shader based debayering solution.
  */
 
+/* Full screen quad, shared by every pass */
+static const GLfloat kVertexCoordinates[4][2] = {
+	{ -1.0f, -1.0f },
+	{ -1.0f, +1.0f },
+	{ +1.0f, +1.0f },
+	{ +1.0f, -1.0f },
+};
+
+static const GLfloat kTextureCoordinates[4][2] = {
+	{ 0.0f, 0.0f },
+	{ 0.0f, 1.0f },
+	{ 1.0f, 1.0f },
+	{ 1.0f, 0.0f },
+};
+
+static const GLfloat kIdentityMatrix[16] = {
+	1.0f, 0.0f, 0.0f, 0.0f,
+	0.0f, 1.0f, 0.0f, 0.0f,
+	0.0f, 0.0f, 1.0f, 0.0f,
+	0.0f, 0.0f, 0.0f, 1.0f,
+};
+
 /**
  * \brief Construct a DebayerEGL object
  * \param[in] stats Statistics processing object
@@ -56,7 +78,13 @@ int DebayerEGL::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
 	BayerFormat bayerFormat =
 		BayerFormat::fromPixelFormat(inputFormat);
 
-	std::vector<PixelFormat> outputFormats = { formats::XRGB8888,
+	/*
+	 * YUYV is listed first because that is what video applications
+	 * (browsers, video conferencing) consume; the RGB formats stay
+	 * available for still capture and for applications that prefer them.
+	 */
+	std::vector<PixelFormat> outputFormats = { formats::YUYV,
+						   formats::XRGB8888,
 						   formats::ARGB8888,
 						   formats::XBGR8888,
 						   formats::ABGR8888 };
@@ -99,6 +127,11 @@ int DebayerEGL::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
 
 int DebayerEGL::getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config)
 {
+	if (outputFormat == formats::YUYV) {
+		config.bpp = 16;
+		return 0;
+	}
+
 	if (outputFormat == formats::XRGB8888 || outputFormat == formats::ARGB8888 ||
 	    outputFormat == formats::XBGR8888 || outputFormat == formats::ABGR8888) {
 		config.bpp = 32;
@@ -172,6 +205,13 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
 	case formats::ABGR8888:
 	case formats::XBGR8888:
 		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
+		break;
+	case formats::YUYV:
+		/*
+		 * The first pass renders into an ordinary RGBA texture, the
+		 * packing into YUYV happens in a second pass, so no channel
+		 * reordering is needed here.
+		 */
 		break;
 	default:
 		LOG(Debayer, Error) << "Unsupported output format";
@@ -286,7 +326,61 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
 		return -ENODEV;
 	}
 
-	return getShaderVariableLocations();
+	int ret = getShaderVariableLocations();
+	if (ret)
+		return ret;
+
+	if (outputFormat == formats::YUYV)
+		return initYUYVShaders();
+
+	return 0;
+}
+
+int DebayerEGL::initYUYVShaders()
+{
+	std::vector<std::string> shaderEnv;
+
+	egl_.pushEnv(shaderEnv, "#version 100");
+
+	if (egl_.compileVertexShader(yuyvVertexShaderId_, identity_vert,
+				     shaderEnv)) {
+		LOG(Debayer, Error) << "Compile YUYV vertex shader fail";
+		return -ENODEV;
+	}
+	utils::scope_exit vShaderGuard([&] { glDeleteShader(yuyvVertexShaderId_); });
+
+	if (egl_.compileFragmentShader(yuyvFragmentShaderId_, rgb_to_yuyv_frag,
+				       shaderEnv)) {
+		LOG(Debayer, Error) << "Compile YUYV fragment shader fail";
+		return -ENODEV;
+	}
+	utils::scope_exit fShaderGuard([&] { glDeleteShader(yuyvFragmentShaderId_); });
+
+	if (egl_.linkProgram(yuyvProgramId_, yuyvVertexShaderId_,
+			     yuyvFragmentShaderId_)) {
+		LOG(Debayer, Error) << "Linking YUYV program fail";
+		return -ENODEV;
+	}
+
+	egl_.dumpShaderSource(yuyvVertexShaderId_);
+	egl_.dumpShaderSource(yuyvFragmentShaderId_);
+
+	yuyvAttributeVertex_ = glGetAttribLocation(yuyvProgramId_, "vertexIn");
+	yuyvAttributeTexture_ = glGetAttribLocation(yuyvProgramId_, "textureIn");
+	yuyvTextureUniformIn_ = glGetUniformLocation(yuyvProgramId_, "tex_rgb");
+	yuyvTextureUniformStep_ = glGetUniformLocation(yuyvProgramId_, "tex_step");
+	yuyvTextureUniformStrideFactor_ = glGetUniformLocation(yuyvProgramId_, "stride_factor");
+	yuyvTextureUniformProjMatrix_ = glGetUniformLocation(yuyvProgramId_, "proj_matrix");
+
+	LOG(Debayer, Debug) << "YUYV vertexIn " << yuyvAttributeVertex_
+			    << " textureIn " << yuyvAttributeTexture_
+			    << " tex_rgb " << yuyvTextureUniformIn_
+			    << " tex_step " << yuyvTextureUniformStep_;
+
+	/* Leave the debayer program active, the pass is selected per frame. */
+	egl_.useProgram(programId_);
+
+	return 0;
 }
 
 int DebayerEGL::configure(const StreamConfiguration &inputCfg,
@@ -352,6 +446,16 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
 
 	inputBufferCount_ = inputCfg.bufferCount;
 	outputBufferCount_ = outputCfg.bufferCount;
+
+	/*
+	 * A YUYV buffer is imported as a 32-bit image in which one texel holds
+	 * two pixels, so the image is half as wide as the frame. The stride is
+	 * padded, which only adds texels at the end of a row that are never
+	 * rendered to.
+	 */
+	outputIsYUYV_ = outputPixelFormat_ == formats::YUYV;
+	outputImageWidth_ = outputIsYUYV_ ? outputConfig_.stride / 4
+					  : outputSize_.width;
 
 	return 0;
 }
@@ -423,29 +527,15 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
 		0, 0, 1, 0,
 		trans, trans, 0, 1
 	};
-	/* Static const coordinates */
-	static const GLfloat vcoordinates[4][2] = {
-		{ -1.0f, -1.0f },
-		{ -1.0f, +1.0f },
-		{ +1.0f, +1.0f },
-		{ +1.0f, -1.0f },
-	};
-	static const GLfloat tcoordinates[4][2] = {
-		{ 0.0f, 0.0f },
-		{ 0.0f, 1.0f },
-		{ 1.0f, 1.0f },
-		{ 1.0f, 0.0f },
-	};
-
 	/* vertexIn - bayer_8.vert */
 	glEnableVertexAttribArray(attributeVertex_);
 	glVertexAttribPointer(attributeVertex_, 2, GL_FLOAT, GL_TRUE,
-			      2 * sizeof(GLfloat), vcoordinates);
+			      2 * sizeof(GLfloat), kVertexCoordinates);
 
 	/* textureIn - bayer_8.vert */
 	glEnableVertexAttribArray(attributeTexture_);
 	glVertexAttribPointer(attributeTexture_, 2, GL_FLOAT, GL_TRUE,
-			      2 * sizeof(GLfloat), tcoordinates);
+			      2 * sizeof(GLfloat), kTextureCoordinates);
 
 	/*
 	 * Set the sampler2D to the respective texture unit for each texutre
@@ -549,6 +639,36 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
 	return;
 }
 
+/**
+ * \brief Set up the state for the RGB to YUYV packing pass
+ * \param[in] eglImageIn The RGB image produced by the demosaicing pass
+ *
+ * The packing pass covers the whole output buffer with the identity
+ * projection, and samples the RGB image at the centre of each pixel pair.
+ */
+void DebayerEGL::setYUYVShaderVariableValues(eGLImage &eglImageIn)
+{
+	GLfloat step[] = { 1.0f / outputSize_.width, 1.0f / outputSize_.height };
+
+	glEnableVertexAttribArray(yuyvAttributeVertex_);
+	glVertexAttribPointer(yuyvAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
+			      2 * sizeof(GLfloat), kVertexCoordinates);
+
+	glEnableVertexAttribArray(yuyvAttributeTexture_);
+	glVertexAttribPointer(yuyvAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
+			      2 * sizeof(GLfloat), kTextureCoordinates);
+
+	glActiveTexture(eglImageIn.texture_unit_);
+	glBindTexture(GL_TEXTURE_2D, eglImageIn.texture_);
+	glUniform1i(yuyvTextureUniformIn_, eglImageIn.texture_unit_uniform_id_);
+	glActiveTexture(GL_TEXTURE0);
+
+	glUniform2fv(yuyvTextureUniformStep_, 1, step);
+	glUniform1f(yuyvTextureUniformStrideFactor_, 1.0f);
+	glUniformMatrix4fv(yuyvTextureUniformProjMatrix_, 1, GL_FALSE,
+			   kIdentityMatrix);
+}
+
 eGLImage *DebayerEGL::getCachedInputFrameBuffer(FrameBuffer *input, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer)
 {
 	const SharedFD &fd = input->planes()[0].fd;
@@ -618,7 +738,7 @@ eGLImage *DebayerEGL::getCachedOutputFrameBuffer(FrameBuffer *output)
 			LOG(Debayer, Debug) << "Output cache " << outputBufferCount_ << " exceeded evicted entry";
 		}
 
-		eglImageOutCache_.emplace_back(fd, std::make_unique<eGLImage>(GL_RGBA, outputSize_.width,
+		eglImageOutCache_.emplace_back(fd, std::make_unique<eGLImage>(GL_RGBA, outputImageWidth_,
 									      outputSize_.height, outputConfig_.stride, GL_TEXTURE1, 1));
 		eglImageOut = eglImageOutCache_.back().second.get();
 
@@ -646,6 +766,16 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
 	if (!eglImageOut)
 		return -ENOMEM;
 
+	if (outputIsYUYV_) {
+		int ret = rgbToYUYV(*eglImageOut, *eglImageIn, params);
+		if (ret)
+			return ret;
+
+		egl_.flushOutput();
+
+		return 0;
+	}
+
 	egl_.attachTextureToFBO(*eglImageOut);
 	setShaderVariableValues(*eglImageIn, params);
 
@@ -659,6 +789,59 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
 		return -ENODEV;
 	} else {
 		egl_.flushOutput();
+	}
+
+	return 0;
+}
+
+/**
+ * \brief Debayer into the RGB intermediate and pack the result into YUYV
+ *
+ * The demosaicing pass runs exactly as it does for an RGB output, except that
+ * it renders into an intermediate RGBA texture. A second, very cheap pass then
+ * reads two horizontally adjacent pixels per output texel and writes
+ * Y0 U Y1 V into the four bytes of that texel, which is the memory layout of
+ * a packed YUYV pixel pair.
+ *
+ * Splitting the work in two passes keeps the expensive demosaicing shader
+ * unchanged, at the cost of one extra full-frame write and read in GPU memory.
+ */
+int DebayerEGL::rgbToYUYV(eGLImage &eglImageOut, eGLImage &eglImageIn,
+			  const DebayerParams &params)
+{
+	/*
+	 * First pass: Bayer to RGB in the intermediate texture. The viewport
+	 * is the input size, not the output size: the projection matrix places
+	 * the scaled image in the bottom left corner of the viewport, which is
+	 * the bottom left corner of the (smaller) output buffer, so that the
+	 * rendered image covers exactly the output buffer.
+	 */
+	egl_.attachTextureToFBO(*rgbIntermediate_);
+	egl_.useProgram(programId_);
+	setShaderVariableValues(eglImageIn, params);
+
+	glViewport(0, 0, width_, height_);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+
+	GLenum err = glGetError();
+	if (err != GL_NO_ERROR) {
+		LOG(eGL, Error) << "Drawing RGB intermediate fail " << err;
+		return -ENODEV;
+	}
+
+	/* Second pass: pack the RGB image into YUYV */
+	egl_.attachTextureToFBO(eglImageOut);
+	egl_.useProgram(yuyvProgramId_);
+	setYUYVShaderVariableValues(*rgbIntermediate_);
+
+	glViewport(0, 0, outputSize_.width / 2, outputSize_.height);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+
+	err = glGetError();
+	if (err != GL_NO_ERROR) {
+		LOG(eGL, Error) << "Drawing YUYV fail " << err;
+		return -ENODEV;
 	}
 
 	return 0;
@@ -730,6 +913,20 @@ int DebayerEGL::start()
 	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
 		return -EINVAL;
 
+	/*
+	 * The intermediate the demosaicing pass renders into when a YUYV
+	 * output is requested. It is a plain texture, so unlike the output
+	 * buffer it needs no DMA-BUF import and can use the natural stride.
+	 */
+	if (outputIsYUYV_) {
+		rgbIntermediate_ = std::make_unique<eGLImage>(GL_RGBA,
+							     outputSize_.width,
+							     outputSize_.height,
+							     outputSize_.width * 4,
+							     GL_TEXTURE0, 0);
+		egl_.createOutputTexture2D(*rgbIntermediate_);
+	}
+
 	return 0;
 }
 
@@ -737,9 +934,13 @@ void DebayerEGL::stop()
 {
 	eglImageOutCache_.clear();
 	eglImageInCache_.clear();
+	rgbIntermediate_.reset();
 
 	if (programId_)
 		glDeleteProgram(programId_);
+
+	if (yuyvProgramId_)
+		glDeleteProgram(yuyvProgramId_);
 }
 
 SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
