@@ -5,11 +5,17 @@ help() {
 	echo "$0: Load an application with libcamera V4L2 compatibility layer preload"
 	echo " $0 [OPTIONS...] executable [args]"
 	echo " -d, --debug	Increase log level"
+	echo " -c, --camera N	Use camera N (when several cameras share the device nodes)"
 }
 
 debug=0
+camera=""
 while [ $# -gt 0 ]; do
 	case $1 in
+		-c|--camera)
+			shift
+			camera="$1"
+			;;
 		-d|--debug)
 			debug=$((debug+1))
 			;;
@@ -43,5 +49,7 @@ else
 fi
 
 export LD_PRELOAD
+
+[ -n "$camera" ] && export LIBCAMERA_V4L2_CAMERA="$camera"
 
 exec "$@"
