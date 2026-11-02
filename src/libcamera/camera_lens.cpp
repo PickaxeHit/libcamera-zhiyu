@@ -73,6 +73,15 @@ int CameraLens::init()
 		return ret;
 
 	model_ = subdev_->model();
+
+	/*
+	 * Do not keep the actuator open: opening it powers the VCM up, and
+	 * discoverAncillaryDevices() runs whenever a camera is enumerated, so
+	 * holding it open would power the lens of one camera while another one
+	 * is being used.  The control info stays cached, and setFocusPosition()
+	 * opens the device only when a focus position is actually written.
+	 */
+	subdev_->close();
 	return 0;
 }
 
@@ -86,13 +95,17 @@ int CameraLens::init()
  */
 int CameraLens::setFocusPosition(int32_t position)
 {
+	int ret = subdev_->open();
+	if (ret < 0)
+		return ret;
+
 	ControlList lensCtrls(subdev_->controls());
 	lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE, static_cast<int32_t>(position));
 
-	if (subdev_->setControls(&lensCtrls))
-		return -EINVAL;
+	ret = subdev_->setControls(&lensCtrls) ? -EINVAL : 0;
 
-	return 0;
+	subdev_->close();
+	return ret;
 }
 
 int CameraLens::validateLensDriver()
