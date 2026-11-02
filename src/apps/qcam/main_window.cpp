@@ -7,24 +7,14 @@
 
 #include "main_window.h"
 
-#include <algorithm>
 #include <assert.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <iomanip>
-#include <linux/videodev2.h>
 #include <string>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
 
 #include <libcamera/camera_manager.h>
 #include <libcamera/version.h>
 
 #include <QCoreApplication>
-#include <QDir>
-#include <QEventLoop>
-#include <QFile>
 #include <QFileDialog>
 #include <QImage>
 #include <QImageWriter>
@@ -222,12 +212,6 @@ int MainWindow::createToolbars()
 	action->setShortcut(QKeySequence::SaveAs);
 	connect(action, &QAction::triggered, this, &MainWindow::saveImageAs);
 
-	/* Auto focus action. */
-	action = toolbar_->addAction(QIcon::fromTheme("camera-focus",
-						      QIcon(":aperture.svg")),
-				     "Auto focus");
-	connect(action, &QAction::triggered, this, [this]() { autoFocus(); });
-
 #ifdef HAVE_TIFF
 	/* Save Raw action. */
 	action = toolbar_->addAction(QIcon::fromTheme("camera-photo",
@@ -239,179 +223,6 @@ int MainWindow::createToolbars()
 #endif
 
 	return 0;
-}
-
-namespace {
-
-/*
- * The lens is a plain V4L2 sub-device, and the simple pipeline has no
- * autofocus algorithm, so the focus search lives here and drives the kernel
- * driver directly, through the name the driver registers.
- */
-QString findLens()
-{
-	const QDir dir("/sys/class/video4linux");
-	const QStringList entries = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
-
-	for (const QString &entry : entries) {
-		QFile name(dir.filePath(entry) + "/name");
-		if (!name.open(QIODevice::ReadOnly))
-			continue;
-		if (name.readAll().contains("dw9807"))
-			return "/dev/" + entry;
-	}
-
-	return QString();
-}
-
-/*
- * Variance of the Laplacian over a small greyscale copy of the frame: high
- * when the image has strong edges, low when the lens is out of focus.
- */
-double imageSharpness(const QImage &image)
-{
-	const QImage small = image.scaled(320, 240, Qt::KeepAspectRatio,
-					  Qt::SmoothTransformation)
-				  .convertToFormat(QImage::Format_Grayscale8);
-	if (small.isNull())
-		return 0.0;
-
-	const int w = small.width();
-	const int h = small.height();
-	double sum = 0.0, sum2 = 0.0;
-	long n = 0;
-
-	for (int y = 1; y < h - 1; y++) {
-		const uchar *r0 = small.constScanLine(y - 1);
-		const uchar *r1 = small.constScanLine(y);
-		const uchar *r2 = small.constScanLine(y + 1);
-		for (int x = 1; x < w - 1; x++) {
-			double lap = -4.0 * r1[x] + r0[x] + r2[x]
-				   + r1[x - 1] + r1[x + 1];
-			sum += lap;
-			sum2 += lap * lap;
-			n++;
-		}
-	}
-
-	if (!n)
-		return 0.0;
-
-	const double mean = sum / n;
-	return sum2 / n - mean * mean;
-}
-
-void setLensFocus(int fd, int value)
-{
-	struct v4l2_control ctrl = { V4L2_CID_FOCUS_ABSOLUTE, value };
-	if (::ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0)
-		qWarning("Auto focus: cannot set focus to %d: %s", value,
-			 strerror(errno));
-}
-
-} /* namespace */
-
-/*
- * Wait for the pipeline to deliver new frames, so that a focus position is
- * scored on an image taken after the lens moved, instead of on a stale one.
- */
-void MainWindow::waitForFrames(unsigned int count)
-{
-	const uint32_t target = framesCaptured_ + count;
-	QElapsedTimer timer;
-	timer.start();
-
-	while (framesCaptured_ < target && timer.elapsed() < 1000)
-		QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
-}
-
-void MainWindow::autoFocus()
-{
-	if (!viewfinder_) {
-		qWarning("Auto focus: the camera is not capturing");
-		return;
-	}
-
-	const QString lens = findLens();
-	if (lens.isEmpty()) {
-		qWarning("Auto focus: no lens driver found");
-		return;
-	}
-
-	const int fd = ::open(lens.toLatin1().constData(), O_RDWR);
-	if (fd < 0) {
-		qWarning("Auto focus: cannot open %s: %s", qPrintable(lens),
-			 strerror(errno));
-		return;
-	}
-
-	struct v4l2_queryctrl query = {};
-	query.id = V4L2_CID_FOCUS_ABSOLUTE;
-	if (::ioctl(fd, VIDIOC_QUERYCTRL, &query) < 0 || query.maximum <= query.minimum) {
-		qWarning("Auto focus: %s has no focus range", qPrintable(lens));
-		::close(fd);
-		return;
-	}
-
-	const int lo = query.minimum, hi = query.maximum;
-	int best = lo, coarse = (hi - lo) / 16 ? (hi - lo) / 16 : 1;
-
-	auto measure = [&](int value) {
-		setLensFocus(fd, value);
-		waitForFrames(2);
-		return imageSharpness(viewfinder_->getCurrentImage());
-	};
-
-	/*
-	 * One continuous path for the whole search: every move is a single step,
-	 * with no jump anywhere, and the lens changes direction only at the ends.
-	 *
-	 *   current -> lo        walk down from wherever the lens is
-	 *   lo -> hi             the coarse sweep itself, ascending
-	 *   hi -> best - coarse  walk down to just below the best position
-	 *   best - coarse -> best + coarse   fine sweep, ascending
-	 *
-	 * Constant-size steps matter for more than tidiness: the actuator is open
-	 * loop, and a step much larger than the previous one yanks the coil hard
-	 * enough that the lens overshoots and knocks against its stop.
-	 */
-	int current = lo;
-	{
-		struct v4l2_control ctrl = { V4L2_CID_FOCUS_ABSOLUTE, 0 };
-		if (::ioctl(fd, VIDIOC_G_CTRL, &ctrl) == 0)
-			current = std::clamp(ctrl.value, lo, hi);
-	}
-
-	double bestScore = -1.0;
-
-	auto walk = [&](int from, int to, int step) {
-		if (step < 1)
-			step = 1;
-		const int dir = to >= from ? step : -step;
-		for (int value = from; dir > 0 ? value <= to : value >= to; value += dir) {
-			const double score = measure(value);
-			if (score > bestScore) {
-				bestScore = score;
-				best = value;
-			}
-		}
-	};
-
-	/* Down to the near end, then the coarse sweep up to the far end. */
-	walk(current, lo, coarse);
-	walk(lo, hi, coarse);
-
-	/* Back down to just below the best, then refine upwards through it. */
-	const int fine = coarse / 4 ? coarse / 4 : 1;
-	const int span = std::max(lo, best - coarse);
-	walk(hi, span, coarse);
-	walk(span, std::min(hi, best + coarse), fine);
-
-	setLensFocus(fd, best);
-	::close(fd);
-
-	qInfo("Auto focus: focus set to %d of %d..%d, sharpness %.1f", best, lo, hi,
-	      bestScore);
 }
 
 void MainWindow::quit()
