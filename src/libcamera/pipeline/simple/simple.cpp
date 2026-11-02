@@ -678,16 +678,15 @@ int SimpleCameraData::init()
 	}
 
 	if (lensEntity_) {
+		/*
+		 * Only remember the actuator here.  Opening it would power the
+		 * VCM up and run its power-on sequence, and init() runs for every
+		 * camera the application enumerates: opening one camera would then
+		 * move the lens of another.  configure() opens it to read the
+		 * control range and start() opens it for streaming, both of which
+		 * only happen for the camera that is actually being used.
+		 */
 		lens_ = std::make_unique<V4L2Subdevice>(lensEntity_);
-		if (lens_->open() != 0) {
-			lens_.reset();
-		} else {
-			LOG(SimplePipeline, Debug)
-				<< "Using " << lensEntity_->name()
-				<< " as the focus lens";
-			/* Do not hold it open (and powered) while idle. */
-			lens_->close();
-		}
 	}
 
 	video_ = pipe->video(entities_.back().entity);
@@ -1720,8 +1719,11 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
 	} else {
 		ipa::soft::IPAConfigInfo configInfo;
 		configInfo.sensorControls = data->sensor_->controls();
-		if (data->lens_)
+		if (data->lens_ && data->lens_->open() == 0) {
 			configInfo.lensControls = data->lens_->controls();
+			/* Powered only while streaming; start() opens it again. */
+			data->lens_->close();
+		}
 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
 	}
 }
