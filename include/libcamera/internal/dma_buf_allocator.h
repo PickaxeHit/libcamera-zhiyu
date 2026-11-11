@@ -44,10 +44,25 @@ private:
 	std::unique_ptr<FrameBuffer> createBuffer(
 		std::string name, const std::vector<unsigned int> &planeSizes);
 
-	UniqueFD allocFromHeap(const char *name, std::size_t size);
-	UniqueFD allocFromUDmaBuf(const char *name, std::size_t size);
+	UniqueFD allocFromHeap(int fd, const char *name, std::size_t size);
+	UniqueFD allocFromUDmaBuf(int fd, const char *name, std::size_t size);
+	UniqueFD allocFromProvider(int fd, DmaBufAllocatorFlag type,
+				   const char *name, std::size_t size);
 	UniqueFD providerHandle_;
 	DmaBufAllocatorFlag type_;
+
+	/*
+	 * Providers opened in addition to the primary one, tried in order when
+	 * the primary cannot satisfy an allocation.  The most common case is a
+	 * CMA heap that is heavily fragmented (or simply too small) while the
+	 * device can do scatter-gather DMA just as well, e.g. camss, which has
+	 * its own IOMMU and uses vb2_dma_sg.
+	 */
+	struct FallbackProvider {
+		DmaBufAllocatorFlag type;
+		UniqueFD handle;
+	};
+	std::vector<FallbackProvider> fallbacks_;
 };
 
 class DmaSyncer final

@@ -109,10 +109,21 @@ DmaBufAllocator::DmaBufAllocator(DmaBufAllocatorFlags type)
 			continue;
 		}
 
-		LOG(DmaBufAllocator, Debug) << "Using " << info.deviceNodeName;
-		providerHandle_ = UniqueFD(ret);
-		type_ = info.type;
-		break;
+		if (!providerHandle_.isValid()) {
+			LOG(DmaBufAllocator, Debug) << "Using " << info.deviceNodeName;
+			providerHandle_ = UniqueFD(ret);
+			type_ = info.type;
+			continue;
+		}
+
+		/*
+		 * Keep the remaining providers as fallbacks: the preferred heap
+		 * can run out of contiguous memory while another one can still
+		 * serve the buffer.
+		 */
+		LOG(DmaBufAllocator, Debug)
+			<< "Fallback provider " << info.deviceNodeName;
+		fallbacks_.push_back({ info.type, UniqueFD(ret) });
 	}
 
 	if (!providerHandle_.isValid())
@@ -129,7 +140,7 @@ DmaBufAllocator::~DmaBufAllocator() = default;
  * \brief Check if the DmaBufAllocator instance is valid
  * \return True if the DmaBufAllocator is valid, false otherwise
  */
-UniqueFD DmaBufAllocator::allocFromUDmaBuf(const char *name, std::size_t size)
+UniqueFD DmaBufAllocator::allocFromUDmaBuf(int fd, const char *name, std::size_t size)
 {
 	/* Size must be a multiple of the page size. Round it up. */
 	std::size_t pageMask = sysconf(_SC_PAGESIZE) - 1;
@@ -147,7 +158,7 @@ UniqueFD DmaBufAllocator::allocFromUDmaBuf(const char *name, std::size_t size)
 	create.offset = 0;
 	create.size = size;
 
-	int ret = ::ioctl(providerHandle_.get(), UDMABUF_CREATE, &create);
+	int ret = ::ioctl(fd, UDMABUF_CREATE, &create);
 	if (ret < 0) {
 		ret = errno;
 		LOG(DmaBufAllocator, Error)
@@ -160,7 +171,7 @@ UniqueFD DmaBufAllocator::allocFromUDmaBuf(const char *name, std::size_t size)
 	return UniqueFD(ret);
 }
 
-UniqueFD DmaBufAllocator::allocFromHeap(const char *name, std::size_t size)
+UniqueFD DmaBufAllocator::allocFromHeap(int fd, const char *name, std::size_t size)
 {
 	struct dma_heap_allocation_data alloc = {};
 	int ret;
@@ -168,7 +179,7 @@ UniqueFD DmaBufAllocator::allocFromHeap(const char *name, std::size_t size)
 	alloc.len = size;
 	alloc.fd_flags = O_CLOEXEC | O_RDWR;
 
-	ret = ::ioctl(providerHandle_.get(), DMA_HEAP_IOCTL_ALLOC, &alloc);
+	ret = ::ioctl(fd, DMA_HEAP_IOCTL_ALLOC, &alloc);
 	if (ret < 0) {
 		LOG(DmaBufAllocator, Error)
 			<< "dma-heap allocation failure for " << name;
@@ -197,15 +208,34 @@ UniqueFD DmaBufAllocator::allocFromHeap(const char *name, std::size_t size)
  *
  * \return The UniqueFD of the allocated buffer
  */
+UniqueFD DmaBufAllocator::allocFromProvider(int fd, DmaBufAllocatorFlag type,
+					    const char *name, std::size_t size)
+{
+	if (type == DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf)
+		return allocFromUDmaBuf(fd, name, size);
+	else
+		return allocFromHeap(fd, name, size);
+}
+
 UniqueFD DmaBufAllocator::alloc(const char *name, std::size_t size)
 {
 	if (!name)
 		return {};
 
-	if (type_ == DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf)
-		return allocFromUDmaBuf(name, size);
-	else
-		return allocFromHeap(name, size);
+	UniqueFD fd = allocFromProvider(providerHandle_.get(), type_, name, size);
+	if (fd.isValid())
+		return fd;
+
+	for (auto &provider : fallbacks_) {
+		LOG(DmaBufAllocator, Debug)
+			<< "Falling back to another dma-buf provider for " << name;
+		fd = allocFromProvider(provider.handle.get(), provider.type,
+				       name, size);
+		if (fd.isValid())
+			return fd;
+	}
+
+	return {};
 }
 
 /**
