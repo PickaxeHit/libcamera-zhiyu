@@ -125,25 +125,6 @@ int DebayerEGL::getInputConfig(PixelFormat inputFormat, DebayerInputConfig &conf
 	return -EINVAL;
 }
 
-int DebayerEGL::getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config)
-{
-	if (outputFormat == formats::YUYV) {
-		config.bpp = 16;
-		return 0;
-	}
-
-	if (outputFormat == formats::XRGB8888 || outputFormat == formats::ARGB8888 ||
-	    outputFormat == formats::XBGR8888 || outputFormat == formats::ABGR8888) {
-		config.bpp = 32;
-		return 0;
-	}
-
-	LOG(Debayer, Info)
-		<< "Unsupported output format " << outputFormat;
-
-	return -EINVAL;
-}
-
 int DebayerEGL::getShaderVariableLocations(void)
 {
 	attributeVertex_ = glGetAttribLocation(programId_, "vertexIn");
@@ -380,7 +361,7 @@ int DebayerEGL::initYUYVShaders()
 			    << " tex_step " << yuyvTextureUniformStep_;
 
 	/* Leave the debayer program active, the pass is selected per frame. */
-	egl_.useProgram(programId_);
+	glUseProgram(programId_);
 
 	return 0;
 }
@@ -791,7 +772,7 @@ int DebayerEGL::rgbToYUYV(eGLImage &eglImageOut, eGLImage &eglImageIn,
 	 * rendered image covers exactly the output buffer.
 	 */
 	egl_.attachTextureToFBO(*rgbIntermediate_);
-	egl_.useProgram(programId_);
+	glUseProgram(programId_);
 	setShaderVariableValues(eglImageIn, params);
 
 	glViewport(0, 0, width_, height_);
@@ -806,7 +787,7 @@ int DebayerEGL::rgbToYUYV(eGLImage &eglImageOut, eGLImage &eglImageIn,
 
 	/* Second pass: pack the RGB image into YUYV */
 	egl_.attachTextureToFBO(eglImageOut);
-	egl_.useProgram(yuyvProgramId_);
+	glUseProgram(yuyvProgramId_);
 	setYUYVShaderVariableValues(*rgbIntermediate_);
 
 	glViewport(0, 0, outputSize_.width / 2, outputSize_.height);
@@ -898,6 +879,8 @@ int DebayerEGL::start()
 					   GL_TEXTURE2,
 					   2);
 		egl_.createTexture2D(*eglImageLscLookup_, nullptr, GL_LINEAR);
+	}
+
 	/*
 	 * The intermediate the demosaicing pass renders into when a YUYV
 	 * output is requested. It is a plain texture, so unlike the output
