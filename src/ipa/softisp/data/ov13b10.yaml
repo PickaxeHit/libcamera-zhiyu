@@ -18,7 +18,21 @@ algorithms:
                 -0.15, -0.30,  1.45 ]
   - Adjust:
   - Agc:
-  # The dw9807 lens is driven by the contrast-detect autofocus; without a
-  # lens position map the dioptre values are uncalibrated.
+  # The dw9807 lens is driven by the contrast-detect autofocus.  There is no
+  # calibrated lens map yet, so the dioptre values are relative: the range
+  # stops short of the far end (where the software scan only finds sensor
+  # noise) and the contrast ratio is relaxed, otherwise a low-contrast scene
+  # reports a failed scan instead of the best position found.
   - Af:
+      ranges:
+        normal:
+          min: 0.0
+          max: 15.0
+          default: 2.0
+      speeds:
+        normal:
+          step_coarse: 1.0
+          step_fine: 0.25
+          contrast_ratio: 0.95
+      skip_frames: 4
 ...
