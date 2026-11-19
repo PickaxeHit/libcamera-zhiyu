@@ -175,6 +175,13 @@ void AfContrast::parseTuning(const ValueNode &tuningData)
 		});
 	}
 
+	/*
+	 * Cameras with a focus lens autofocus by default.  Applications that
+	 * never set AfMode (most of them) would otherwise leave the lens at
+	 * its power-on position, which on this board is far from focused.
+	 */
+	setMode(controls::AfModeContinuous);
+
 	/* Keep the scan ranges within the positions the lens can reach. */
 	Pwl::Interval limits = map_.domain();
 	for (RangeParams &range : ranges_) {
