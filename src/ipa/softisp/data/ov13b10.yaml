@@ -18,4 +18,7 @@ algorithms:
                 -0.15, -0.30,  1.45 ]
   - Adjust:
   - Agc:
+  # The dw9807 lens is driven by the contrast-detect autofocus; without a
+  # lens position map the dioptre values are uncalibrated.
+  - Af:
 ...
